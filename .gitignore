@@ -1,0 +1,4 @@
+repos/
+.framework/
+survey/*/candidates/
+__dump/

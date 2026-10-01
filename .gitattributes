@@ -1,0 +1,10 @@
+* text=auto
+CLAUDE.md text eol=lf
+*.md text eol=lf
+*.ps1 text eol=lf
+*.psd1 text eol=lf
+*.psm1 text eol=lf
+*.json text eol=lf
+*.html text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
