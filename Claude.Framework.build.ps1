@@ -13,7 +13,8 @@
                   Writes each env entry to User scope, the only place the build writes outside the repo.
     Sync          clones or fast-forwards every child in framework.yaml into repos/.
     Status        prints branch (with "(expected <x>)" when it differs from framework.yaml), ahead/behind, dirty count, last commit, build script and TestedAt per child.
-                  TestedAt is the commit of the newest run record, with 'stale' when HEAD has moved since.
+                  TestedAt is the commit of the newest run record, with 'stale' when HEAD has moved since. Then how many
+                  getters in the newest heartbeat ended ok, failed, refused and skipped.
     Test          runs each child's test_task (default Test; full_test_task with -Full, where declared) in a fresh
                   pwsh in its folder (tasks_before_test first), then SelfTest the same way; prints actual against
                   the expect block in framework.yaml, with the commit tested (* when dirty). A child's verify is
@@ -28,10 +29,14 @@
                   A child on a branch other than its expected one fails Requirements, so Up stops before Sync.
                   Verify is heartbeat-only unless -Verify.
     Heartbeat     Requirements, Sync, Test (never Verify), then Verify for every child that declares it, then each
-                  getter in framework.yaml by order in its own fresh pwsh rooted in its path under repos/, its Pester
-                  when tests: true, Diff last against the previous heartbeat, then Status. Each getter row carries its
-                  getter and graded commits, seconds and verdict line; a declared output missing under {out} fails it. A failing getter does not
-                  stop the run; the task fails at the end if any getter, child Test or Verify failed.
+                  getter in framework.yaml in its own fresh pwsh rooted in its path under repos/, its Pester when
+                  tests: true, Diff last against the previous heartbeat, then Status. Getters run after the getters
+                  their needs: name, ties broken by order; a need naming no getter, or needs in a cycle, refuse the run
+                  before Sync. Each getter ends ok, failed, refused (non-zero exit, last line beginning "refused", kept
+                  as the reason) or skipped; one whose need failed or refused is skipped with "needs <x>". Each row
+                  carries its needs, getter and graded commits, seconds and verdict line; a declared output missing
+                  under {out} fails it. A failing getter does not stop the run; the task fails at the end if any getter
+                  failed or refused, or any child Test or Verify failed.
                   -SkipUp skips Sync and Test and reuses the newest test run, refusing one that is partial (-Only) or
                   has no summary.json unless -AllowPartial, which stamps heartbeat.json partial with the untested
                   children. -Only names children and/or getters.
@@ -87,6 +92,9 @@ task Sync $SyncJob
 task Status {
     Get-FrameworkStatus -Manifest (Get-FrameworkManifest $ManifestPath) -ReposRoot $ReposRoot -RunsRoot (Join-Path $BuildRoot '.framework' 'test-runs') |
         Format-Table -AutoSize | Out-String -Width 200
+    $o = Get-FrameworkGetterOutcomes (Join-Path $BuildRoot '.framework' 'heartbeats')
+    if ($o) { print Cyan "Getters (heartbeat $($o.Stamp)): ok $($o.Ok), failed $($o.Failed), refused $($o.Refused), skipped $($o.Skipped)" }
+    else { print Cyan 'Getters: no heartbeat yet' }
 }
 
 task Test {
@@ -114,13 +122,15 @@ task Up Requirements, Bootstrap, Sync, Test, Status
 $HeartbeatFailures = @()
 
 task Heartbeat Requirements, {
+    # Refuses before Sync on a need naming no getter, or needs that form a cycle.
+    $null = Get-FrameworkGetterOrder (Get-FrameworkManifest $ManifestPath).Getters
     if ($SkipUp) { print Cyan 'Sync and Test skipped (-SkipUp)' } else { . $SyncJob }
     $hb = Invoke-FrameworkHeartbeat -Manifest (Get-FrameworkManifest $ManifestPath) -ReposRoot $ReposRoot -FrameworkRoot $BuildRoot -Only $Only -Full:$Full -SkipUp:$SkipUp -AllowPartial:$AllowPartial -KeepRuns $KeepRuns
     print Cyan "Test run $($hb.TestRun.folder)$(if ($hb.TestRun.reused) { " (reused: $($hb.TestRun.reason))" })"
     if ($hb.Partial) { print Yellow "partial: true; untested: $(if ($hb.Untested) { $hb.Untested -join ', ' } else { 'none' })" }
     $hb.TestRows | Format-Table Name, Task, Result, Expected, Passed, Failed, Skipped, Verify, Commit, Seconds, Note -AutoSize -Wrap | Out-String -Width 250
     if ($hb.VerifyRows) { $hb.VerifyRows | Format-Table Name, Verify, Commit, Seconds, Note -AutoSize -Wrap | Out-String -Width 250 }
-    $hb.Getters | Format-Table Name, Result, GetterCommit, GradedCommit, Passed, Failed, Seconds, Verdict, Note -AutoSize -Wrap | Out-String -Width 250
+    $hb.Getters | Format-Table Name, Needs, Result, GetterCommit, GradedCommit, Passed, Failed, Seconds, Verdict, Note -AutoSize -Wrap | Out-String -Width 250
     if ($hb.Diff) { print Cyan "Diff: $($hb.Diff)" }
     print Cyan "Heartbeat record: $(Join-Path $hb.Folder 'heartbeat.json')"
     $script:HeartbeatFailures = @($hb.Failures)

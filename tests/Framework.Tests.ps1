@@ -158,10 +158,10 @@ Describe 'framework.yaml getters' {
         $ok = "  - name: A`n    path: getters/A`n    entry:`n      script: tools/Run.ps1`n    cadence: every`n    order: 1"
     }
 
-    It 'registers six getters, Diff last; all but Secrets are entry: none, no path, not promoted yet' {
+    It 'registers seven getters, Diff last; all but Shape and Secrets are entry: none, no path, not promoted yet' {
         $g = (Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Getters
-        $g.Name | Should -Be @('Catalogue', 'Hardening', 'Incidents', 'Shape', 'Secrets', 'Diff')
-        foreach ($x in @($g | Where-Object Name -ne 'Secrets')) {
+        $g.Name | Should -Be @('Catalogue', 'Hardening', 'Incidents', 'Shape', 'Secrets', 'Coverage', 'Diff')
+        foreach ($x in @($g | Where-Object Name -notin 'Shape', 'Secrets')) {
             $x.Entry | Should -BeNullOrEmpty
             $x.Path | Should -BeNullOrEmpty
             $x.Note | Should -Be 'not promoted to repos/ yet'
@@ -178,6 +178,27 @@ Describe 'framework.yaml getters' {
         $s.Outputs | Should -Be @('findings.json', 'summary.md')
         $s.Order | Should -Be 50
         $s.Cadence | Should -Be 'every'
+    }
+
+    It 'Shape runs Claude.Modules tools/Get-FrameworkShape.ps1 with -Root and -Out, order 40, every, needing nothing' {
+        $s = (Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Getters | Where-Object Name -eq 'Shape'
+        $s.Path | Should -Be 'Claude.Modules'
+        $s.Entry.Script | Should -Be 'tools/Get-FrameworkShape.ps1'
+        @($s.Entry.Parameters.Keys | Sort-Object) | Should -Be @('Out', 'Root')
+        $s.Entry.Parameters.Root | Should -Be '{framework_root}'
+        $s.Entry.Parameters.Out | Should -Be '{out}'
+        $s.Outputs | Should -Be @('graph.json')
+        $s.Order | Should -Be 40
+        $s.Cadence | Should -Be 'every'
+        @($s.Needs).Count | Should -Be 0
+    }
+
+    It 'Coverage and Diff need Shape; the real order runs Shape before both and Diff last' {
+        $g = (Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Getters
+        foreach ($n in 'Coverage', 'Diff') { ($g | Where-Object Name -eq $n).Needs | Should -Be @('Shape') }
+        $order = @(Get-FrameworkGetterOrder $g).Name
+        $order[-1] | Should -Be 'Diff'
+        $order.IndexOf('Shape') | Should -BeLessThan $order.IndexOf('Coverage')
     }
 
     It 'an output that climbs out of {out} fails to load' {
@@ -312,12 +333,12 @@ getters:
         $by = @{}; $first.Getters | ForEach-Object { $by[$_.Name] = $_ }
     }
 
-    It 'the pass row and the fail row both appear, and the fail does not stop the run' {
+    It 'the ok row and the failed row both appear, and the failure does not stop the run' {
         $first.Getters.Name | Should -Be @('Good', 'Bad', 'Later', 'Diff')
-        $by['Good'].Result | Should -Be 'pass'
-        $by['Bad'].Result | Should -Be 'fail'
+        $by['Good'].Result | Should -Be 'ok'
+        $by['Bad'].Result | Should -Be 'failed'
         $by['Bad'].Note | Should -Match 'entry exit 1'
-        $by['Diff'].Result | Should -Be 'pass'
+        $by['Diff'].Result | Should -Be 'ok'
         Join-Path $first.Folder 'Good' 'out.txt' | Should -Exist
         Get-Content (Join-Path $first.Folder 'Bad.log') | Should -Contain 'bad getter ran'
     }
@@ -338,15 +359,15 @@ getters:
         $rec.getter_commit | Should -Be $goodHead
         $rec.graded_commit | Should -Be $gradedHead
         $rec.getter_dirty | Should -BeFalse
-        $rec.result | Should -Be 'pass'
+        $rec.result | Should -Be 'ok'
         $raw | Should -Match '"tested_at":\s*"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d"'
         $rec.entry_line | Should -Be "& ./tools/Write-Out.ps1 -Out '$(Join-Path $first.Folder 'Good')'"
         $by['Good'].GetterCommit | Should -Be $goodHead.Substring(0, 7)
         $by['Good'].GradedCommit | Should -Be $gradedHead.Substring(0, 7)
     }
 
-    It 'entry: none is listed as not runnable with its note' {
-        $by['Later'].Result | Should -Be 'not runnable'
+    It 'entry: none is skipped with its note' {
+        $by['Later'].Result | Should -Be 'skipped'
         $by['Later'].Note | Should -Be 'entry: none; not promoted to repos/ yet'
         Join-Path $first.Folder 'Later.log' | Should -Not -Exist
         Join-Path $first.Folder 'Later' | Should -Not -Exist
@@ -355,7 +376,7 @@ getters:
     It 'entry: none spawns no pwsh' {
         Mock -ModuleName Framework.Build Invoke-ChildProcess { 0 }
         $r = Invoke-FrameworkHeartbeat -Manifest $hbManifest -ReposRoot $hbRepos -FrameworkRoot $hbFramework -Only Later
-        ($r.Getters | Where-Object Name -eq 'Later').Result | Should -Be 'not runnable'
+        ($r.Getters | Where-Object Name -eq 'Later').Note | Should -BeLike 'entry: none*'
         @($r.Getters | Where-Object Name -ne 'Later').Result | Should -Be @('skipped', 'skipped', 'skipped')
         Should -Invoke -ModuleName Framework.Build Invoke-ChildProcess -Times 0 -Exactly
     }
@@ -1033,7 +1054,7 @@ getters:
     }
 
     It 'runs the entry in a fresh pwsh rooted in its path, with {framework_root}, {repos_root} and {out} substituted' {
-        $by['Scan'].Result | Should -Be 'pass'
+        $by['Scan'].Result | Should -Be 'ok'
         $out = Join-Path $hb.Folder 'Scan'
         $proofPid, $cwd, $root, $repos = (Get-Content -LiteralPath (Join-Path $out 'proof.txt')) -split '\|'
         [int]$proofPid | Should -Not -Be $PID
@@ -1063,9 +1084,120 @@ getters:
     }
 
     It 'a declared output the entry did not write fails the getter, naming it' {
-        $by['Short'].Result | Should -Be 'fail'
+        $by['Short'].Result | Should -Be 'failed'
         $by['Short'].Note | Should -Match 'missing output\(s\) under \{out\}: absent\.md'
         $hb.Failures | Should -Be @('getter Short')
+    }
+}
+
+Describe 'Getter needs and outcomes' {
+    BeforeAll {
+        $pester = [string](Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Requirements.pester
+        $nBase = "requirements:`n  pester: '$pester'`nchildren:`n  - name: Kid`n    url: https://example.invalid/Kid.git`n    default_branch: main`n    build_script: false`ngetters:`n"
+        function Write-Needs { param([string]$Name, [string]$Body) $p = Join-Path $RunRoot "needs-$Name.yaml"; Set-Content -LiteralPath $p -Value ($nBase + $Body); $p }
+        function Get-Row { param([string]$Name, [int]$Order, [string[]]$Needs) "  - name: $Name`n    entry: none`n    cadence: every`n    order: $Order" + $(if ($Needs) { "`n    needs: [$($Needs -join ', ')]" }) }
+
+        # Stub getters: Base fails, Ref refuses, Fine succeeds. Dep needs Base, DepR needs Ref, Chain needs Dep.
+        $nRepos = Join-Path $RunRoot 'needs-repos'
+        $stubs = @{
+            Base = 'param($Out) "base broke"; exit 1'
+            Ref  = 'param($Out) "looking"; "refused: Out lies inside Root"; exit 2'
+            Fine = 'param($Out) Set-Content -LiteralPath (Join-Path $Out "ran.txt") -Value ran; "all fine"'
+            Dep  = 'param($Out) Set-Content -LiteralPath (Join-Path $Out "ran.txt") -Value ran'
+        }
+        foreach ($k in $stubs.Keys) {
+            $dir = Join-Path $nRepos 'getters' $k
+            $null = New-Item -ItemType Directory -Path (Join-Path $dir 'tools') -Force
+            Set-Content -LiteralPath (Join-Path $dir 'tools' 'Run.ps1') -Value $stubs[$k]
+            G $dir init --quiet --initial-branch=main | Out-Null
+            G $dir add -A | Out-Null
+            G $dir commit --quiet -m fixture | Out-Null
+        }
+        $runnable = { param($Name, $Dir, $Order, $Needs) "  - name: $Name`n    path: getters/$Dir`n    entry:`n      script: tools/Run.ps1`n      parameters:`n        Out: '{out}'`n    cadence: every`n    order: $Order" + $(if ($Needs) { "`n    needs: [$Needs]" }) }
+        $body = @(
+            & $runnable 'Chain' 'Dep' 1 'Dep'
+            & $runnable 'Base' 'Base' 2
+            & $runnable 'Ref' 'Ref' 3
+            & $runnable 'Fine' 'Fine' 4
+            & $runnable 'Dep' 'Dep' 5 'Base'
+            & $runnable 'DepR' 'Dep' 6 'Ref'
+            (Get-Row 'Later' 7)
+        ) -join "`n"
+        $nManifest = Get-FrameworkManifest (Write-Needs 'heartbeat' $body)
+        $nFramework = Join-Path $RunRoot 'needs-framework'
+        $null = New-Item -ItemType Directory -Path $nFramework -Force
+        Set-Content -LiteralPath (Join-Path $nFramework '.gitignore') -Value '.framework/'
+        G $nFramework init --quiet --initial-branch=main | Out-Null
+        G $nFramework add -A | Out-Null
+        G $nFramework commit --quiet -m fixture | Out-Null
+        $run = Join-Path $nFramework '.framework' 'test-runs' '20260101-000000-001'
+        $null = New-Item -ItemType Directory -Path $run -Force
+        Set-Content -LiteralPath (Join-Path $run 'summary.json') -Value (@{
+                partial = $false; only = @(); env = @{}
+                rows = @(@{ Name = 'Kid'; Result = 'no build script'; Verify = 'not applicable' }, @{ Name = 'Claude.Framework'; Result = 'pass'; Verify = 'not applicable' })
+            } | ConvertTo-Json -Depth 4)
+        $nHb = Invoke-FrameworkHeartbeat -Manifest $nManifest -ReposRoot $nRepos -FrameworkRoot $nFramework -SkipUp
+        $nBy = @{}; $nHb.Getters | ForEach-Object { $nBy[$_.Name] = $_ }
+    }
+
+    It 'orders by needs, breaking a tie by order' {
+        # A (1) and D (4) both need C (3); B (2) needs nothing. B and C run first, then A before D by order.
+        $body = @((Get-Row 'A' 1 'C'), (Get-Row 'B' 2), (Get-Row 'C' 3), (Get-Row 'D' 4 'C')) -join "`n"
+        $g = (Get-FrameworkManifest (Write-Needs 'tie' $body)).Getters
+        (Get-FrameworkGetterOrder $g).Name | Should -Be @('B', 'C', 'A', 'D')
+    }
+
+    It 'refuses a cycle, naming the getters in it, before any heartbeat folder exists' {
+        $body = @((Get-Row 'A' 1 'B'), (Get-Row 'B' 2 'A'), (Get-Row 'C' 3)) -join "`n"
+        $m = Get-FrameworkManifest (Write-Needs 'cycle' $body)
+        { Get-FrameworkGetterOrder $m.Getters } | Should -Throw '*refuses to start*cycle*A needs B*B needs A*'
+        $root = Join-Path $RunRoot 'needs-cycle'
+        { Invoke-FrameworkHeartbeat -Manifest $m -ReposRoot $nRepos -FrameworkRoot $root -SkipUp } | Should -Throw '*cycle*'
+        Join-Path $root '.framework' 'heartbeats' | Should -Not -Exist
+    }
+
+    It 'refuses a need naming no getter' {
+        $body = @((Get-Row 'A' 1 'Nope'), (Get-Row 'B' 2)) -join "`n"
+        { Get-FrameworkGetterOrder (Get-FrameworkManifest (Write-Needs 'unknown' $body)).Getters } | Should -Throw '*refuses to start*unknown getter*A needs Nope*'
+    }
+
+    It 'runs a getter after its need, whatever its order' {
+        $nHb.Getters.Name | Should -Be @('Base', 'Ref', 'Fine', 'Dep', 'Chain', 'DepR', 'Later')
+        $nBy['Chain'].Needs | Should -Be 'Dep'
+        $nBy['Fine'].Needs | Should -Be '-'
+    }
+
+    It 'skips a getter whose need failed, with reason, and never runs it; the skip carries on down the chain' {
+        $nBy['Dep'].Result | Should -Be 'skipped'
+        $nBy['Dep'].Note | Should -Be 'needs Base'
+        Join-Path $nHb.Folder 'Dep' | Should -Not -Exist
+        Join-Path $nHb.Folder 'Dep.log' | Should -Not -Exist
+        $nBy['Chain'].Result | Should -Be 'skipped'
+        $nBy['Chain'].Note | Should -Be 'needs Dep'
+        $nBy['DepR'].Result | Should -Be 'skipped'
+        $nBy['DepR'].Note | Should -Be 'needs Ref'
+        (Get-Content (Join-Path $nHb.Folder 'Dep.result.json') -Raw | ConvertFrom-Json).needs | Should -Be @('Base')
+    }
+
+    It 'parses refused from a stub getter: non-zero exit, last line kept as the reason' {
+        $nBy['Ref'].Result | Should -Be 'refused'
+        $nBy['Ref'].Note | Should -Be 'refused: Out lies inside Root'
+        $nBy['Ref'].Verdict | Should -Be 'refused: Out lies inside Root'
+        $nBy['Base'].Result | Should -Be 'failed'
+        $nBy['Base'].Note | Should -Be 'entry exit 1'
+        $nHb.Failures | Should -Be @('getter Base', 'getter Ref')
+    }
+
+    It 'every getter ends ok, failed, refused or skipped, and the record and Status counts agree' {
+        @($nHb.Getters | Where-Object Result -notin 'ok', 'failed', 'refused', 'skipped').Count | Should -Be 0
+        $nBy['Fine'].Result | Should -Be 'ok'
+        $nBy['Later'].Result | Should -Be 'skipped'
+        $nHb.Outcomes.ok, $nHb.Outcomes.failed, $nHb.Outcomes.refused, $nHb.Outcomes.skipped | Should -Be @(1, 1, 1, 4)
+        $rec = (Get-Content (Join-Path $nHb.Folder 'heartbeat.json') -Raw | ConvertFrom-Json).getter_outcomes
+        $rec.ok, $rec.failed, $rec.refused, $rec.skipped | Should -Be @(1, 1, 1, 4)
+        $o = Get-FrameworkGetterOutcomes (Join-Path $nFramework '.framework' 'heartbeats')
+        $o.Stamp | Should -Be $nHb.Stamp
+        $o.Ok, $o.Failed, $o.Refused, $o.Skipped | Should -Be @(1, 1, 1, 4)
     }
 }
 
@@ -1151,7 +1283,7 @@ getters:
         $hb = Invoke-FrameworkHeartbeat -Manifest $bManifest -ReposRoot $bRepos -FrameworkRoot (Join-Path $RunRoot 'branch-framework') -SkipUp -AllowPartial
         $hb.VerifyRows[0].Verify | Should -Be 'refused'
         $hb.VerifyRows[0].Note | Should -Match 'feature/trap'
-        $hb.Getters[0].Result | Should -Be 'fail'
+        $hb.Getters[0].Result | Should -Be 'refused'
         $hb.Getters[0].Note | Should -Be 'Trap on branch feature/trap, expected main; not run'
         Join-Path $hb.Folder 'Rooted' | Should -Not -Exist
         $hb.Failures | Should -Contain 'verify Trap'

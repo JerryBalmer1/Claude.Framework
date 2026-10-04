@@ -97,7 +97,7 @@ function ConvertTo-FrameworkGetter {
     foreach ($field in 'name', 'order', 'cadence', 'entry') {
         if (-not $Block.Contains($field) -or $null -eq $Block[$field] -or "$($Block[$field])" -eq '') { throw "Manifest getter '$name' is missing '$field'." }
     }
-    $unknown = @($Block.Keys | Where-Object { $_ -notin 'name', 'path', 'entry', 'tests', 'expects', 'outputs', 'cadence', 'order', 'note' })
+    $unknown = @($Block.Keys | Where-Object { $_ -notin 'name', 'path', 'entry', 'tests', 'expects', 'outputs', 'cadence', 'order', 'note', 'needs' })
     if ($unknown) { throw "Manifest getter '$name': unknown key(s) $($unknown -join ', ')." }
     if (($Block.order -isnot [int] -and $Block.order -isnot [long]) -or $Block.order -lt 0) { throw "Manifest getter '$name': order must be a whole number >= 0." }
     if ("$($Block.cadence)" -notin 'every', 'weekly') { throw "Manifest getter '$name': cadence must be every or weekly, not '$($Block.cadence)'." }
@@ -133,10 +133,17 @@ function ConvertTo-FrameworkGetter {
         $bad = @($Block.expects.Keys | Where-Object { $_ -notin 'expected_failures', 'no_tests', 'reason' })
         if ($bad) { throw "Manifest getter '$name': unknown expects key(s) $($bad -join ', ')." }
     }
+    # needs names other getters that must run first. Whether each exists, and whether they form a cycle, is
+    # Get-FrameworkGetterOrder's to say: Heartbeat refuses to start on either.
+    $needs = @(foreach ($n in @($Block['needs'] | Where-Object { $null -ne $_ })) {
+            if ($n -isnot [string] -or -not $n) { throw "Manifest getter '$name': each need must be a getter name, not '$n'." }
+            $n
+        })
     [pscustomobject]@{
         Name    = [string]$name
         Path    = if ($null -ne $path) { [string]$path }
         Entry   = $entry
+        Needs   = @($needs | Select-Object -Unique)
         Tests   = $tests
         Outputs = $outputs
         Expect  = ConvertTo-ChildExpectation -Name $name -Block $Block['expects']
@@ -162,6 +169,57 @@ function ConvertTo-FrameworkGetters {
     $diff = $sorted | Where-Object Name -eq 'Diff'
     if ($diff -and $sorted[-1].Name -ne 'Diff') { throw "Manifest getter Diff must be last (highest order); $($sorted[-1].Name) has order $($sorted[-1].Order), Diff $($diff.Order)." }
     $sorted
+}
+
+function Get-FrameworkGetterOrder {
+    # The getters in the order Heartbeat runs them: every getter after the getters it needs, ties broken by order.
+    # Throws, so Heartbeat refuses to start, when a need names no getter, when needs form a cycle, or when the
+    # needs would run anything after Diff.
+    param([object[]]$Getters)
+    $getters = @($Getters | Where-Object { $_ } | Sort-Object Order)
+    $names = @($getters | ForEach-Object Name)
+    $unknown = @(foreach ($g in $getters) { foreach ($n in @($g.Needs)) { if ($n -notin $names) { "$($g.Name) needs $n" } } })
+    if ($unknown) { throw "Heartbeat refuses to start: unknown getter in needs: $($unknown -join '; '). Getters: $($names -join ', ')." }
+    $done = [System.Collections.Generic.List[string]]::new()
+    $ordered = [System.Collections.Generic.List[object]]::new()
+    while ($ordered.Count -lt $getters.Count) {
+        # The lowest-order getter whose needs have all run.
+        $next = $getters | Where-Object { $_.Name -notin $done -and -not @(@($_.Needs) | Where-Object { $_ -notin $done }) } | Select-Object -First 1
+        if (-not $next) {
+            $left = @($getters | Where-Object Name -notin $done | ForEach-Object { "$($_.Name) needs $(@($_.Needs) -join ', ')" })
+            throw "Heartbeat refuses to start: getter needs form a cycle: $($left -join '; ')."
+        }
+        $done.Add($next.Name)
+        $ordered.Add($next)
+    }
+    if ($names -contains 'Diff' -and $ordered[-1].Name -ne 'Diff') { throw "Heartbeat refuses to start: needs put $($ordered[-1].Name) after Diff, which must run last." }
+    @($ordered)
+}
+
+function Get-GetterOutcome {
+    # One of ok, failed, refused, skipped for a getter's result as a heartbeat recorded it. Records written before
+    # slice four-d say pass, fail or not runnable.
+    param([string]$Result)
+    switch ($Result) { 'pass' { 'ok' } 'fail' { 'failed' } 'not runnable' { 'skipped' } default { $Result } }
+}
+
+function Get-FrameworkGetterOutcomes {
+    # How many getters in the newest heartbeat.json under $HeartbeatsRoot ended ok, failed, refused and skipped,
+    # with that heartbeat's stamp; $null when there is none.
+    param([string]$HeartbeatsRoot)
+    foreach ($f in Get-StampFolders $HeartbeatsRoot) {
+        $file = Join-Path $f.FullName 'heartbeat.json'
+        if (-not (Test-Path -LiteralPath $file)) { continue }
+        $results = @((Get-Content -LiteralPath $file -Raw | ConvertFrom-Json).getters | ForEach-Object { Get-GetterOutcome $_.result })
+        return [pscustomobject]@{
+            Stamp   = $f.Name
+            Ok      = @($results | Where-Object { $_ -eq 'ok' }).Count
+            Failed  = @($results | Where-Object { $_ -eq 'failed' }).Count
+            Refused = @($results | Where-Object { $_ -eq 'refused' }).Count
+            Skipped = @($results | Where-Object { $_ -eq 'skipped' }).Count
+        }
+    }
+    $null
 }
 
 function Expand-FrameworkPlaceholder {
@@ -985,11 +1043,13 @@ function Get-GetterInvocation {
 
 function Invoke-FrameworkHeartbeat {
     # Test (or, with -SkipUp, the newest test run reused), then Verify for every child that declares it, then each
-    # getter by order in its own fresh pwsh rooted in its path under repos/, its Pester when tests: true, Diff last
-    # against the previous heartbeat. A failing getter is recorded and the next one runs. Output, logs and one
+    # getter in its own fresh pwsh rooted in its path under repos/, its Pester when tests: true, Diff last against the
+    # previous heartbeat. Getters run after the getters they need, ties broken by order; an unknown need or a cycle
+    # refuses the run before it starts. Each getter ends ok, failed, refused or skipped; one whose need failed or
+    # refused is skipped with "needs <x>". A failing getter is recorded and the next one runs. Output, logs and one
     # <getter>.result.json per getter go to .framework/heartbeats/<stamp>/, which keeps the latest -KeepRuns folders;
     # heartbeat.json at its root is the record. -Only names children and/or getters; anything not named is skipped.
-    # Failures lists every getter fail, child Test FAIL and Verify 'does not'; the build fails the task on any.
+    # Failures lists every getter failed or refused, child Test FAIL and Verify 'does not'; the build fails the task on any.
     # A reused run (-SkipUp, or -Only naming no child) must be the newest test run, with summary.json and not partial;
     # -AllowPartial accepts a partial or summary-less one and the record says partial with the children left untested.
     # StateRoot (default <FrameworkRoot>/.framework) holds test-runs/ and heartbeats/.
@@ -1005,7 +1065,8 @@ function Invoke-FrameworkHeartbeat {
         [string]$StateRoot
     )
     if (-not $StateRoot) { $StateRoot = Join-Path $FrameworkRoot '.framework' }
-    $getters = @($Manifest.Getters)
+    # Refuses here, before anything runs or is written, on an unknown need or a cycle.
+    $getters = @(Get-FrameworkGetterOrder $Manifest.Getters)
     $childNames = @($Manifest.Children | ForEach-Object Name) + 'Claude.Framework'
     $valid = $childNames + @($getters | ForEach-Object Name)
     $unknown = @($Only | Where-Object { $_ -and $_ -notin $valid })
@@ -1042,7 +1103,7 @@ function Invoke-FrameworkHeartbeat {
         $file = Join-Path $f.FullName 'heartbeat.json'
         if (-not (Test-Path -LiteralPath $file)) { continue }
         foreach ($g in @((Get-Content -LiteralPath $file -Raw | ConvertFrom-Json).getters)) {
-            if ($g.result -in 'pass', 'fail' -and -not $lastRan.ContainsKey($g.name)) { $lastRan[$g.name] = [datetimeoffset]$g.tested_at }
+            if ((Get-GetterOutcome $g.result) -in 'ok', 'failed', 'refused' -and -not $lastRan.ContainsKey($g.name)) { $lastRan[$g.name] = [datetimeoffset]$g.tested_at }
         }
     }
 
@@ -1117,6 +1178,8 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
     $graded = Get-CheckoutOrNone $FrameworkRoot
     $diffVerdict = $null
     $records = [System.Collections.Generic.List[object]]::new()
+    # Getters that failed or refused, or were skipped for a need of theirs; anything needing one is skipped.
+    $blocked = [System.Collections.Generic.HashSet[string]]::new()
     $getterRows = @(foreach ($g in $getters) {
         $testedAt = & $now
         $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -1125,11 +1188,14 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
         # A getter rooted in a child's folder runs only from that child's expected branch.
         $owner = if ($g.Path) { $Manifest.Children | Where-Object Name -eq (@($g.Path -split '[\\/]')[0]) | Select-Object -First 1 }
         $refusal = if ($owner -and $checkout) { Get-BranchRefusal $owner $checkout }
+        $unmet = @(@($g.Needs) | Where-Object { $blocked.Contains($_) })
         $line = $null; $counts = $null; $seconds = $null; $verdictLine = $null
+        # Every getter ends in exactly one of ok, failed, refused or skipped.
         $result, $note = if (-not (& $selected $g.Name)) { 'skipped', '-Only' }
-        elseif (-not $g.Entry) { 'not runnable', ((@('entry: none', $g.Note) | Where-Object { $_ }) -join '; ') }
-        elseif (-not (Test-Path -LiteralPath $path -PathType Container)) { 'not runnable', "repos/$($g.Path) not found" }
-        elseif ($refusal) { 'fail', "$($owner.Name) $refusal" }
+        elseif ($unmet) { 'skipped', "needs $($unmet -join ', ')" }
+        elseif (-not $g.Entry) { 'skipped', ((@('entry: none', $g.Note) | Where-Object { $_ }) -join '; ') }
+        elseif (-not (Test-Path -LiteralPath $path -PathType Container)) { 'skipped', "repos/$($g.Path) not found" }
+        elseif ($refusal) { 'refused', "$($owner.Name) $refusal" }
         elseif ($g.Cadence -eq 'weekly' -and $g.Name -notin @($Only) -and $lastRan.ContainsKey($g.Name) -and $lastRan[$g.Name] -gt [DateTimeOffset]::Now.AddDays(-7)) {
             'skipped', "weekly; last ran $($lastRan[$g.Name].ToString('yyyy-MM-dd HH:mm'))"
         }
@@ -1146,8 +1212,13 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
             if ($g.Note) { $notes.Add($g.Note) }
             $exit = Invoke-ChildProcess -WorkingDirectory $path -Script $getterScript -ArgumentList $g.Entry.Script, ($inv.Parameters | ConvertTo-Json -Compress -Depth 4) -LogFile (Join-Path $folder "$($g.Name).log")
             if ($exit -ne 0) { $notes.Add("entry exit $exit") }
+            # The last line the entry printed. A non-zero exit whose last line begins with "refused" is a refusal, and
+            # that line is its reason; its tests and outputs are not checked.
+            $printed = @(Get-Content -LiteralPath (Join-Path $folder "$($g.Name).log") -ErrorAction SilentlyContinue | Where-Object { "$_".Trim() })
+            $lastLine = if ($printed) { "$($printed[-1])".Trim() }
+            $refused = $exit -ne 0 -and $lastLine -like 'refused*'
             $verdict = $null
-            if ($g.Tests) {
+            if ($g.Tests -and -not $refused) {
                 $junit = Join-Path $out "$($g.Name).junit.xml"
                 $testsPath = if (Test-Path -LiteralPath (Join-Path $path 'tests') -PathType Container) { Join-Path $path 'tests' } else { $path }
                 $texit = Invoke-ChildProcess -WorkingDirectory $path -Script $testScript -ArgumentList $testsPath, $junit, $pester -LogFile (Join-Path $folder "$($g.Name).tests.log")
@@ -1156,14 +1227,17 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
                 $verdict = Get-TestVerdict -ExitCode $texit -Counts $counts -Expect $g.Expect -TestFileCount $files
                 if ($verdict.Note) { $notes.Add("tests $($verdict.Result): $($verdict.Note)") }
             }
-            $missing = @($g.Outputs | Where-Object { -not (Test-Path -LiteralPath (Join-Path $out $_) -PathType Leaf) })
+            $missing = @(if (-not $refused) { $g.Outputs | Where-Object { -not (Test-Path -LiteralPath (Join-Path $out $_) -PathType Leaf) } })
             if ($missing) { $notes.Add("missing output(s) under {out}: $($missing -join ', ')") }
-            $result = if ($exit -ne 0 -or $missing -or ($verdict -and $verdict.Result -eq 'FAIL')) { 'fail' } else { 'pass' }
+            if ($refused) { $notes.Clear(); $notes.Add($lastLine) }
+            $result = if ($refused) { 'refused' } elseif ($exit -ne 0 -or $missing -or ($verdict -and $verdict.Result -eq 'FAIL')) { 'failed' } else { 'ok' }
             # The verdict line: the first line of verdict.txt in the getter's output, else the last line it printed.
             $vf = Join-Path $out 'verdict.txt'
-            $lines = if (Test-Path -LiteralPath $vf) { @(Get-Content -LiteralPath $vf) } else { @(Get-Content -LiteralPath (Join-Path $folder "$($g.Name).log") -ErrorAction SilentlyContinue) }
-            $lines = @($lines | Where-Object { "$_".Trim() })
-            $verdictLine = if ($lines) { if (Test-Path -LiteralPath $vf) { "$($lines[0])".Trim() } else { "$($lines[-1])".Trim() } }
+            $verdictLine = $lastLine
+            if (Test-Path -LiteralPath $vf) {
+                $vlines = @(Get-Content -LiteralPath $vf | Where-Object { "$_".Trim() })
+                $verdictLine = if ($vlines) { "$($vlines[0])".Trim() }
+            }
             if ($g.Name -eq 'Diff') {
                 if (-not $previous) { $notes.Add('no previous heartbeat') }
                 $diffVerdict = $verdictLine
@@ -1188,11 +1262,14 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
             entry_line    = $line
             cadence       = $g.Cadence
             order         = $g.Order
+            needs         = @($g.Needs)
         }
         $rec | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $folder "$($g.Name).result.json")
         $records.Add($rec)
+        if ($result -in 'failed', 'refused' -or ($result -eq 'skipped' -and $unmet)) { $null = $blocked.Add($g.Name) }
         [pscustomobject]@{
             Name         = $g.Name
+            Needs        = if ($g.Needs) { $g.Needs -join ', ' } else { '-' }
             Result       = $result
             GetterCommit = if ($checkout) { Format-ShortCommit $checkout.Commit $checkout.Dirty } else { '-' }
             GradedCommit = if ($graded) { Format-ShortCommit $graded.Commit $graded.Dirty } else { '-' }
@@ -1213,8 +1290,10 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
     $failures = @(
         @($testRows | Where-Object Result -eq 'FAIL' | ForEach-Object { "test $($_.Name)" })
         @($verifyRows | Where-Object Verify -in 'does not', 'refused' | ForEach-Object { "verify $($_.Name)" })
-        @($getterRows | Where-Object Result -eq 'fail' | ForEach-Object { "getter $($_.Name)" })
+        @($getterRows | Where-Object Result -in 'failed', 'refused' | ForEach-Object { "getter $($_.Name)" })
     )
+    $outcomes = [ordered]@{}
+    foreach ($o in 'ok', 'failed', 'refused', 'skipped') { $outcomes[$o] = @($getterRows | Where-Object Result -eq $o).Count }
     $testRun = [ordered]@{ folder = $usedRun.Name; reused = [bool]$reuse; reason = $reuse }
     [ordered]@{
         stamp      = $stamp
@@ -1228,6 +1307,7 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
         children  = $children
         verify    = @($verifyRows | ForEach-Object { [ordered]@{ name = $_.Name; verify = $_.Verify; commit = $_.Commit; seconds = $_.Seconds; note = $_.Note } })
         getters   = @($records)
+        getter_outcomes = $outcomes
         diff      = $diffVerdict
         failures  = $failures
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $folder 'heartbeat.json')
@@ -1242,6 +1322,7 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
         TestRows   = $testRows
         VerifyRows = $verifyRows
         Getters    = $getterRows
+        Outcomes   = [pscustomobject]$outcomes
         Diff       = $diffVerdict
         Failures   = $failures
     }
@@ -1271,4 +1352,5 @@ function Invoke-FrameworkBootstrap {
 
 Export-ModuleMember -Function Get-FrameworkManifest, Test-FrameworkRequirements, Sync-Framework, Sync-FrameworkChild,
     Get-FrameworkStatus, Get-FrameworkTestPlan, Get-FrameworkBranchCheck, Invoke-FrameworkTest, Invoke-ChildTask, Invoke-ChildVerify, Get-TestVerdict,
-    New-FrameworkRunFolder, Invoke-FrameworkBootstrap, Invoke-FrameworkHeartbeat, Resolve-FrameworkEnv, Get-HeartbeatReusedRun
+    New-FrameworkRunFolder, Invoke-FrameworkBootstrap, Invoke-FrameworkHeartbeat, Resolve-FrameworkEnv, Get-HeartbeatReusedRun,
+    Get-FrameworkGetterOrder, Get-FrameworkGetterOutcomes
