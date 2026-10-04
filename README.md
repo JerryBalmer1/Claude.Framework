@@ -18,4 +18,6 @@ The roles below come from a proposal: [docs/roles/2026-09-30-container-declarati
 
 ## Docs
 
-See [docs/](docs/), which contains `assessments/`, `roles/` and `sessions/`.
+See [docs/](docs/), which contains `assessments/`, `prompts/`, `roles/`, `sessions/` and `theory/`.
+
+The docs index is [docs/README.md](docs/README.md).
