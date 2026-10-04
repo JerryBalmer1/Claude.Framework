@@ -13,7 +13,9 @@
                   Writes each env entry to User scope, the only place the build writes outside the repo.
     Sync          clones or fast-forwards every child in framework.yaml into repos/.
     Status        prints branch (with "(expected <x>)" when it differs from framework.yaml), ahead/behind, dirty count, last commit, build script and TestedAt per child.
-                  TestedAt is the commit of the newest run record, with 'stale' when HEAD has moved since. Then how many
+                  Pinned is the commit the newest heartbeat pinned for the child (* when dirty), with 'torn -> <end>'
+                  when it moved during that heartbeat. TestedAt is the commit of the newest run record, with 'stale'
+                  when it is not the pinned commit (with no pin, when HEAD has moved since). Then how many
                   getters in the newest heartbeat ended ok, failed, refused and skipped, with Diff's call beside them
                   when that heartbeat has one, then one row per getter: its outcome and the verdict line from its
                   <Getter>.result.json (the note for a failed getter, and when it left none).
@@ -45,6 +47,15 @@
                   has no summary.json unless -AllowPartial, which stamps heartbeat.json partial with the untested
                   children. -Only names children and/or getters.
                   Results go to .framework/heartbeats/<stamp>/ with heartbeat.json; the latest -KeepRuns are kept.
+                  heartbeat.json follows schema/heartbeat.schema.json. Its pin block holds each child's branch, commit
+                  and dirty flag, read after Sync and before Test, and again after the last getter. A child whose
+                  commit moved or whose dirty flag flipped in between tears the heartbeat: pin torn, and the task
+                  fails with "torn: <child> <start> -> <end>".
+                  -Baseline reads the dirty files of every checkout Dirty grades at start, and reports Dirty unfit only
+                  for files that were not already dirty then. Dirty's printed line stays its verdict; the re-graded
+                  line is recorded beside it as baseline. A baseline run is a working read, not a witness: use it while
+                  a slice has edits in flight. Its record says witness: false and lists the files dirty at start. A
+                  record is a witness only without -Baseline and with the pin held.
 #>
 param(
     # Limit Test to these child names (and/or Claude.Framework). An unknown name fails before any child runs.
@@ -57,6 +68,8 @@ param(
     [switch]$SkipUp,
     # Heartbeat: reuse a newest test run that is partial or has no summary.json, and record it as partial.
     [switch]$AllowPartial,
+    # Heartbeat: grade Dirty only on files not already dirty at start. A working read, not a witness.
+    [switch]$Baseline,
     # Run Bootstrap even when its marker exists.
     [switch]$Force,
     # How many run folders .framework/test-runs/ keeps.
@@ -94,7 +107,7 @@ $SyncJob = {
 task Sync $SyncJob
 
 task Status {
-    Get-FrameworkStatus -Manifest (Get-FrameworkManifest $ManifestPath) -ReposRoot $ReposRoot -RunsRoot (Join-Path $BuildRoot '.framework' 'test-runs') |
+    Get-FrameworkStatus -Manifest (Get-FrameworkManifest $ManifestPath) -ReposRoot $ReposRoot -RunsRoot (Join-Path $BuildRoot '.framework' 'test-runs') -HeartbeatsRoot (Join-Path $BuildRoot '.framework' 'heartbeats') |
         Format-Table -AutoSize | Out-String -Width 200
     Format-FrameworkGetterStatus (Join-Path $BuildRoot '.framework' 'heartbeats') | ForEach-Object { print Cyan $_ }
 }
@@ -127,13 +140,15 @@ task Heartbeat Requirements, {
     # Refuses before Sync on a need naming no getter, or needs that form a cycle.
     $null = Get-FrameworkGetterOrder (Get-FrameworkManifest $ManifestPath).Getters
     if ($SkipUp) { print Cyan 'Sync and Test skipped (-SkipUp)' } else { . $SyncJob }
-    $hb = Invoke-FrameworkHeartbeat -Manifest (Get-FrameworkManifest $ManifestPath) -ReposRoot $ReposRoot -FrameworkRoot $BuildRoot -Only $Only -Full:$Full -SkipUp:$SkipUp -AllowPartial:$AllowPartial -KeepRuns $KeepRuns
+    $hb = Invoke-FrameworkHeartbeat -Manifest (Get-FrameworkManifest $ManifestPath) -ReposRoot $ReposRoot -FrameworkRoot $BuildRoot -Only $Only -Full:$Full -SkipUp:$SkipUp -AllowPartial:$AllowPartial -Baseline:$Baseline -KeepRuns $KeepRuns
     print Cyan "Test run $($hb.TestRun.folder)$(if ($hb.TestRun.reused) { " (reused: $($hb.TestRun.reason))" })"
     if ($hb.Partial) { print Yellow "partial: true; untested: $(if ($hb.Untested) { $hb.Untested -join ', ' } else { 'none' })" }
     $hb.TestRows | Format-Table Name, Task, Result, Expected, Passed, Failed, Skipped, Verify, Commit, Seconds, Note -AutoSize -Wrap | Out-String -Width 250
     if ($hb.VerifyRows) { $hb.VerifyRows | Format-Table Name, Verify, Commit, Seconds, Note -AutoSize -Wrap | Out-String -Width 250 }
     $hb.Getters | Format-Table Name, Needs, Result, GetterCommit, GradedCommit, Passed, Failed, Seconds, Verdict, Note -AutoSize -Wrap | Out-String -Width 250
     if ($hb.Diff) { print Cyan "Diff: $($hb.Diff)" }
+    if ($hb.Pin.verdict -eq 'torn') { print Yellow "Pin: torn: $($hb.Pin.torn -join '; ')" } else { print Cyan "Pin: held, $(@($hb.Pin.children).Count) children" }
+    if ($hb.Baseline) { print Yellow 'Baseline run (-Baseline): a working read, not a witness' }
     print Cyan "Heartbeat record: $(Join-Path $hb.Folder 'heartbeat.json')"
     $script:HeartbeatFailures = @($hb.Failures)
 }, Status, {

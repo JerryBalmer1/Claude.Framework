@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "heartbeat.schema.json",
+  "title": "Claude.Framework heartbeat record",
+  "description": "heartbeat.json at the root of .framework/heartbeats/<stamp>/, written by Invoke-FrameworkHeartbeat (build/Framework.Build.psm1) once every getter has run. Records written before slice four-j have no pin, witness or baseline and do not validate. Generated; never hand-edited.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["stamp", "framework", "test_run", "reused_run", "partial", "untested", "env", "previous", "pin", "witness",
+               "baseline", "children", "verify", "getters", "getter_outcomes", "diff", "failures"],
+  "properties": {
+    "stamp": { "$ref": "#/$defs/stamp" },
+    "framework": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "dirty", "branch"],
+      "properties": {
+        "commit": { "type": ["string", "null"] },
+        "dirty": { "type": ["boolean", "null"] },
+        "branch": { "type": ["string", "null"] }
+      }
+    },
+    "test_run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["folder", "reused", "reason"],
+      "properties": {
+        "folder": { "$ref": "#/$defs/stamp" },
+        "reused": { "type": "boolean" },
+        "reason": { "type": ["string", "null"] }
+      }
+    },
+    "reused_run": { "oneOf": [{ "$ref": "#/$defs/stamp" }, { "type": "null" }] },
+    "partial": { "type": "boolean" },
+    "untested": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "env": { "type": "object", "additionalProperties": { "type": ["string", "null"] } },
+    "previous": { "oneOf": [{ "$ref": "#/$defs/stamp" }, { "type": "null" }] },
+    "pin": {
+      "description": "Each child's checkout under repos/, read after Sync and before Test (start) and again after the last getter (end). torn when any child's commit moved or its dirty flag flipped between the two; the heartbeat then fails, each torn entry naming the child and both commits.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verdict", "started_at", "ended_at", "children", "torn"],
+      "properties": {
+        "verdict": { "enum": ["held", "torn"] },
+        "started_at": { "$ref": "#/$defs/time" },
+        "ended_at": { "$ref": "#/$defs/time" },
+        "children": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["repo", "branch", "commit", "dirty", "end", "held"],
+            "properties": {
+              "repo": { "type": "string", "minLength": 1 },
+              "branch": { "type": ["string", "null"] },
+              "commit": { "$ref": "#/$defs/commitOrNull" },
+              "dirty": { "type": ["boolean", "null"] },
+              "end": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["branch", "commit", "dirty"],
+                "properties": {
+                  "branch": { "type": ["string", "null"] },
+                  "commit": { "$ref": "#/$defs/commitOrNull" },
+                  "dirty": { "type": ["boolean", "null"] }
+                }
+              },
+              "held": { "type": "boolean" }
+            }
+          }
+        },
+        "torn": {
+          "description": "One entry per child that did not hold: '<repo> <start> -> <end>', each commit seven characters with * when dirty.",
+          "type": "array",
+          "items": { "type": "string", "pattern": "^\\S+ (-|[0-9a-f]{7}\\*?) -> (-|[0-9a-f]{7}\\*?)$" }
+        }
+      },
+      "if": { "properties": { "verdict": { "const": "held" } } },
+      "then": { "properties": { "torn": { "maxItems": 0 } } },
+      "else": { "properties": { "torn": { "minItems": 1 } } }
+    },
+    "witness": {
+      "description": "true when the run graded the fleet as it stood: not -Baseline and the pin held. A baseline run is a working read, not a witness.",
+      "type": "boolean"
+    },
+    "baseline": {
+      "description": "null without -Baseline. With it: the dirty files of each checkout Dirty grades (the root and each folder under repos/ with a .git), read at start. Dirty is then reported unfit only for files not already dirty at start.",
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["read", "note", "dirty_at_start"],
+          "properties": {
+            "read": { "const": "working" },
+            "note": { "type": "string", "minLength": 1 },
+            "dirty_at_start": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["checkout", "files"],
+                "properties": {
+                  "checkout": { "type": "string", "minLength": 1 },
+                  "files": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "children": { "type": "array", "items": { "type": "object", "required": ["name"] } },
+    "verify": { "type": "array", "items": { "type": "object", "required": ["name", "verify"] } },
+    "getters": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "result", "verdict", "note"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "result": { "enum": ["ok", "failed", "refused", "skipped"] },
+          "verdict": { "type": ["string", "null"] },
+          "note": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "getter_outcomes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "failed", "refused", "skipped"],
+      "properties": {
+        "ok": { "$ref": "#/$defs/count" },
+        "failed": { "$ref": "#/$defs/count" },
+        "refused": { "$ref": "#/$defs/count" },
+        "skipped": { "$ref": "#/$defs/count" }
+      }
+    },
+    "diff": { "type": ["string", "null"] },
+    "failures": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+  },
+  "$defs": {
+    "stamp": { "type": "string", "pattern": "^\\d{8}-\\d{6}-\\d{3}$" },
+    "time": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}[+-]\\d{2}:\\d{2}$" },
+    "commitOrNull": { "oneOf": [{ "type": "string", "pattern": "^[0-9a-f]{40}$" }, { "type": "null" }] },
+    "count": { "type": "integer", "minimum": 0 }
+  }
+}

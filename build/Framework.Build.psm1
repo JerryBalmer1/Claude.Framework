@@ -231,16 +231,20 @@ function Get-FrameworkGetterOutcomes {
                 $r = Get-Content -LiteralPath $rf -Raw | ConvertFrom-Json
                 $result = Get-GetterOutcome $r.result
                 $verdict = if ($result -ne 'failed' -and "$($r.verdict)") { "$($r.verdict)" } elseif ("$($r.note)") { "$($r.note)" } else { '-' }
+                # A baseline run's Dirty is reported by the line graded against the start, not the line it printed.
+                if ($result -eq 'ok' -and $r.PSObject.Properties['baseline'] -and $r.baseline) { $verdict = "$($r.baseline.verdict) (baseline)" }
                 [pscustomobject]@{ Name = $g.name; Result = $result; Verdict = $verdict }
             })
         return [pscustomobject]@{
-            Stamp   = $f.Name
-            Ok      = @($results | Where-Object { $_ -eq 'ok' }).Count
-            Failed  = @($results | Where-Object { $_ -eq 'failed' }).Count
-            Refused = @($results | Where-Object { $_ -eq 'refused' }).Count
-            Skipped = @($results | Where-Object { $_ -eq 'skipped' }).Count
-            Call    = if ("$($hb.diff)" -match '^\d+ better, \d+ worse, \d+ unknown: (\S+)$') { $Matches[1] }
-            Rows    = $rows
+            Stamp    = $f.Name
+            Ok       = @($results | Where-Object { $_ -eq 'ok' }).Count
+            Failed   = @($results | Where-Object { $_ -eq 'failed' }).Count
+            Refused  = @($results | Where-Object { $_ -eq 'refused' }).Count
+            Skipped  = @($results | Where-Object { $_ -eq 'skipped' }).Count
+            Call     = if ("$($hb.diff)" -match '^\d+ better, \d+ worse, \d+ unknown: (\S+)$') { $Matches[1] }
+            Rows     = $rows
+            Pin      = if ($hb.PSObject.Properties['pin']) { $hb.pin }
+            Baseline = [bool]($hb.PSObject.Properties['baseline'] -and $hb.baseline)
         }
     }
     $null
@@ -255,6 +259,25 @@ function Format-FrameworkGetterStatus {
     "Getters (heartbeat $($o.Stamp)): ok $($o.Ok), failed $($o.Failed), refused $($o.Refused), skipped $($o.Skipped)$(if ($o.Call) { "; diff $($o.Call)" })"
     $nameWidth = (@($o.Rows | ForEach-Object { "$($_.Name)".Length }) + 4 | Measure-Object -Maximum).Maximum
     foreach ($r in $o.Rows) { "  $("$($r.Name)".PadRight($nameWidth))  $("$($r.Result)".PadRight(7))  $($r.Verdict)" }
+    # Heartbeats from slice four-j on carry a pin; earlier ones print no pin line.
+    if ($o.Pin) {
+        if ($o.Pin.verdict -eq 'torn') { "Pin: torn: $(@($o.Pin.torn) -join '; ')" } else { "Pin: held, $(@($o.Pin.children).Count) children" }
+    }
+    if ($o.Baseline) { 'Baseline run: a working read, not a witness' }
+}
+
+function Get-NewestHeartbeatPin {
+    # The pin block of the newest heartbeat.json under $HeartbeatsRoot; $null when there is none or it has no pin
+    # (written before slice four-j).
+    param([string]$HeartbeatsRoot)
+    foreach ($f in Get-StampFolders $HeartbeatsRoot) {
+        $file = Join-Path $f.FullName 'heartbeat.json'
+        if (-not (Test-Path -LiteralPath $file)) { continue }
+        $hb = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
+        if ($hb.PSObject.Properties['pin']) { return $hb.pin }
+        return $null
+    }
+    $null
 }
 
 function Expand-FrameworkPlaceholder {
@@ -567,18 +590,27 @@ function Get-LatestRunRecord {
 }
 
 function Get-FrameworkStatus {
-    # TestedAt reads the newest run record under $RunsRoot; Status runs nothing. 'stale' means HEAD has moved since.
-    param([Parameter(Mandatory)]$Manifest, [Parameter(Mandatory)][string]$ReposRoot, [string]$RunsRoot)
+    # TestedAt reads the newest run record under $RunsRoot; Status runs nothing. Pinned is the commit the newest
+    # heartbeat under $HeartbeatsRoot pinned for the child (* when dirty), with 'torn -> <end>' when it moved during that
+    # heartbeat. 'stale' means the tested commit is not the pinned one, or, with no pin, that HEAD has moved since.
+    param([Parameter(Mandatory)]$Manifest, [Parameter(Mandatory)][string]$ReposRoot, [string]$RunsRoot, [string]$HeartbeatsRoot)
+    $pin = Get-NewestHeartbeatPin $HeartbeatsRoot
     foreach ($c in $Manifest.Children) {
         $path = Join-Path $ReposRoot $c.Name
         $record = Get-LatestRunRecord -RunsRoot $RunsRoot -Name $c.Name
         $testedAt = if ($record -and $record.commit) { Format-ShortCommit $record.commit $false } else { '-' }
+        $p = if ($pin) { @($pin.children) | Where-Object { $_.repo -eq $c.Name } | Select-Object -First 1 }
+        $pinned = if ($p -and $p.commit) {
+            (Format-ShortCommit $p.commit ([bool]$p.dirty)) + $(if (-not $p.held) { " torn -> $(Format-ShortCommit $p.end.commit ([bool]$p.end.dirty))" })
+        }
+        else { '-' }
         if (-not (Test-Path -LiteralPath (Join-Path $path '.git'))) {
-            [pscustomobject]@{ Name = $c.Name; Branch = '(not cloned)'; Ahead = $null; Behind = $null; Dirty = $null; LastCommit = $null; BuildScript = $null; TestedAt = $testedAt }
+            [pscustomobject]@{ Name = $c.Name; Branch = '(not cloned)'; Ahead = $null; Behind = $null; Dirty = $null; LastCommit = $null; BuildScript = $null; Pinned = $pinned; TestedAt = $testedAt }
             continue
         }
         $head = Invoke-Git $path rev-parse --verify --quiet HEAD -AllowFail
-        if ($testedAt -ne '-' -and ($head.ExitCode -ne 0 -or $record.commit -ne $head.Output[0])) { $testedAt += ' stale' }
+        $against = if ($p -and $p.commit) { $p.commit } elseif ($head.ExitCode -eq 0) { $head.Output[0] }
+        if ($testedAt -ne '-' -and $record.commit -ne $against) { $testedAt += ' stale' }
         $branch = @(Invoke-Git $path rev-parse --abbrev-ref HEAD)[0]
         if ($branch -ne $c.Branch) { $branch += " (expected $($c.Branch))" }
         $ahead = $behind = $null
@@ -595,6 +627,7 @@ function Get-FrameworkStatus {
             Dirty       = $dirty
             LastCommit  = ([datetimeoffset]$last).ToString('yyyy-MM-dd HH:mm zzz')
             BuildScript = if ($bs) { $bs.Name } else { '-' }
+            Pinned      = $pinned
             TestedAt    = $testedAt
         }
     }
@@ -1062,6 +1095,89 @@ function Set-RunRecordVerify {
     Set-Content -LiteralPath $Path -Value $n.ToJsonString([System.Text.Json.JsonSerializerOptions]@{ WriteIndented = $true })
 }
 
+function Get-FrameworkPin {
+    # Each child's checkout under repos/ as a heartbeat pins it: repo, branch, commit and dirty. A child not cloned
+    # has null branch, commit and dirty. Reads only.
+    param([Parameter(Mandatory)]$Manifest, [Parameter(Mandatory)][string]$ReposRoot)
+    foreach ($c in $Manifest.Children) {
+        $path = Join-Path $ReposRoot $c.Name
+        $k = if (Test-Path -LiteralPath (Join-Path $path '.git')) { Get-ChildCheckout $path }
+        [ordered]@{ repo = $c.Name; branch = if ($k) { $k.Branch }; commit = if ($k) { $k.Commit }; dirty = if ($k) { $k.Dirty } }
+    }
+}
+
+function Compare-FrameworkPin {
+    # The pin block of a heartbeat record from the start and end reads: each child with its end read and whether it
+    # held (same commit, same dirty flag). verdict is torn when any child did not hold, with one
+    # '<repo> <start> -> <end>' per such child, each commit seven characters and * when dirty.
+    param([AllowEmptyCollection()][object[]]$Start = @(), [AllowEmptyCollection()][object[]]$End = @(), [string]$StartedAt, [string]$EndedAt)
+    $torn = [System.Collections.Generic.List[string]]::new()
+    $children = @(foreach ($s in $Start) {
+            $e = $End | Where-Object { $_.repo -eq $s.repo } | Select-Object -First 1
+            if (-not $e) { $e = [ordered]@{ branch = $null; commit = $null; dirty = $null } }
+            $held = $e.commit -eq $s.commit -and $e.dirty -eq $s.dirty
+            if (-not $held) { $torn.Add("$($s.repo) $(Format-ShortCommit $s.commit ([bool]$s.dirty)) -> $(Format-ShortCommit $e.commit ([bool]$e.dirty))") }
+            [ordered]@{
+                repo = $s.repo; branch = $s.branch; commit = $s.commit; dirty = $s.dirty
+                end = [ordered]@{ branch = $e.branch; commit = $e.commit; dirty = $e.dirty }
+                held = $held
+            }
+        })
+    [ordered]@{ verdict = if ($torn.Count) { 'torn' } else { 'held' }; started_at = $StartedAt; ended_at = $EndedAt; children = $children; torn = @($torn) }
+}
+
+function Get-DirtyFiles {
+    # The paths git status lists in a checkout, each untracked file on its own.
+    param([Parameter(Mandatory)][string]$Path)
+    @(Invoke-Git $Path status --porcelain --untracked-files=all | Where-Object { $_ } | ForEach-Object { $_.Substring(3) })
+}
+
+function Get-FrameworkDirtyBaseline {
+    # For Heartbeat -Baseline: the dirty files of each checkout Dirty grades, read at start. The checkouts are the
+    # Framework root and each folder under repos/ with a .git, each named by its path relative to the root ('.',
+    # 'repos/<name>'), as dirty.json names them.
+    param([Parameter(Mandatory)][string]$FrameworkRoot, [Parameter(Mandatory)][string]$ReposRoot)
+    $dirs = @(Get-Item -LiteralPath $FrameworkRoot)
+    if (Test-Path -LiteralPath $ReposRoot) { $dirs += @(Get-ChildItem -LiteralPath $ReposRoot -Directory | Sort-Object Name) }
+    foreach ($d in $dirs) {
+        if (-not (Test-Path -LiteralPath (Join-Path $d.FullName '.git'))) { continue }
+        [ordered]@{ checkout = [IO.Path]::GetRelativePath($FrameworkRoot, $d.FullName) -replace '\\', '/'; files = @(Get-DirtyFiles $d.FullName) }
+    }
+}
+
+function Get-DirtyBaselineVerdict {
+    # Dirty's dirty.json graded again for -Baseline. A checkout it calls dirty counts as clean when its only dirt is
+    # files (nothing ahead or behind, no incoming folder) and every file git lists in it now was already dirty at start.
+    # Returns Verdict, a line in Dirty's own form; Excused, the checkouts counted clean; and NewDirty, per checkout the
+    # files dirty now that were not at start. Other states are taken as Dirty gave them.
+    param(
+        [Parameter(Mandatory)][string]$DirtyJson,
+        [AllowEmptyCollection()][object[]]$AtStart = @(),
+        [Parameter(Mandatory)][string]$FrameworkRoot
+    )
+    $d = Get-Content -LiteralPath $DirtyJson -Raw | ConvertFrom-Json
+    $totals = [ordered]@{ clean = 0; dirty = 0; 'wrong-branch' = 0; nested = 0 }
+    $excused = [System.Collections.Generic.List[string]]::new()
+    $new = [System.Collections.Generic.List[object]]::new()
+    foreach ($c in @($d.checkouts)) {
+        $state = $c.state
+        if ($state -eq 'dirty') {
+            $s = $AtStart | Where-Object { $_.checkout -eq $c.path } | Select-Object -First 1
+            $start = if ($s) { @($s.files) } else { @() }
+            $fresh = @(Get-DirtyFiles (Join-Path $FrameworkRoot $c.path) | Where-Object { $_ -notin $start })
+            if ($fresh) { $new.Add([ordered]@{ checkout = $c.path; files = $fresh }) }
+            elseif (-not $c.ahead -and -not $c.behind -and -not $c.incoming) { $state = 'clean'; $excused.Add($c.path) }
+        }
+        $totals[$state]++
+    }
+    $word = if ($totals.dirty + $totals.'wrong-branch' + $totals.nested -gt 0) { 'unfit' } else { 'ok' }
+    [pscustomobject]@{
+        Verdict  = '{0} clean, {1} dirty, {2} wrong-branch, {3} nested, {4}' -f $totals.clean, $totals.dirty, $totals.'wrong-branch', $totals.nested, $word
+        Excused  = @($excused)
+        NewDirty = @($new)
+    }
+}
+
 function Get-GetterInvocation {
     # A getter entry's parameters with {out}, {previous}, {framework_root} and {repos_root} filled in, and the line
     # that records what ran.
@@ -1089,6 +1205,12 @@ function Invoke-FrameworkHeartbeat {
     # A reused run (-SkipUp, or -Only naming no child) must be the newest test run, with summary.json and not partial;
     # -AllowPartial accepts a partial or summary-less one and the record says partial with the children left untested.
     # StateRoot (default <FrameworkRoot>/.framework) holds test-runs/ and heartbeats/.
+    # Each child under repos/ is pinned (branch, commit, dirty) before Test and read again after the last getter; a child
+    # whose commit moved or whose dirty flag flipped tears the heartbeat: pin.verdict torn, and a failure
+    # "torn: <child> <start> -> <end>". -Baseline reads the dirty files of every checkout Dirty grades at start and
+    # reports Dirty unfit only for files not already dirty then. A baseline run is a working read, not a witness: the
+    # record says witness: false and carries the files it excused. witness is true only without -Baseline and with the
+    # pin held.
     param(
         [Parameter(Mandatory)]$Manifest,
         [Parameter(Mandatory)][string]$ReposRoot,
@@ -1097,6 +1219,7 @@ function Invoke-FrameworkHeartbeat {
         [switch]$Full,
         [switch]$SkipUp,
         [switch]$AllowPartial,
+        [switch]$Baseline,
         [int]$KeepRuns = 5,
         [string]$StateRoot
     )
@@ -1132,6 +1255,11 @@ function Invoke-FrameworkHeartbeat {
             throw "Heartbeat ($reuse): the newest test run $($usedRun.FullName) $why. Run Invoke-Build Test, then Heartbeat -SkipUp; or pass -AllowPartial to reuse it and record it as partial."
         }
     }
+
+    # Sync has run; nothing of this heartbeat has. The pin is read again after the last getter.
+    $pinStartedAt = & $now
+    $pinStart = @(Get-FrameworkPin -Manifest $Manifest -ReposRoot $ReposRoot)
+    $dirtyAtStart = if ($Baseline) { @(Get-FrameworkDirtyBaseline -FrameworkRoot $FrameworkRoot -ReposRoot $ReposRoot) } else { @() }
 
     # When each weekly getter last ran, from the heartbeats kept so far.
     $lastRan = @{}
@@ -1225,7 +1353,7 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
         $owner = if ($g.Path) { $Manifest.Children | Where-Object Name -eq (@($g.Path -split '[\\/]')[0]) | Select-Object -First 1 }
         $refusal = if ($owner -and $checkout) { Get-BranchRefusal $owner $checkout }
         $unmet = @(@($g.Needs) | Where-Object { $blocked.Contains($_) })
-        $line = $null; $counts = $null; $seconds = $null; $verdictLine = $null
+        $line = $null; $counts = $null; $seconds = $null; $verdictLine = $null; $baselineRec = $null
         # Every getter ends in exactly one of ok, failed, refused or skipped.
         $result, $note = if (-not (& $selected $g.Name)) { 'skipped', '-Only' }
         elseif ($unmet) { 'skipped', "needs $($unmet -join ', ')" }
@@ -1280,6 +1408,15 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
                 if (-not $previous -and $result -ne 'failed') { $notes.Add('no previous heartbeat') }
                 $diffVerdict = $verdictLine
             }
+            # -Baseline: Dirty's printed line stays the verdict; the line graded against the start sits beside it.
+            if ($Baseline -and $g.Name -eq 'Dirty' -and $result -eq 'ok') {
+                try {
+                    $b = Get-DirtyBaselineVerdict -DirtyJson (Join-Path $out 'dirty.json') -AtStart $dirtyAtStart -FrameworkRoot $FrameworkRoot
+                    $baselineRec = [ordered]@{ verdict = $b.Verdict; excused = $b.Excused; new_dirty = $b.NewDirty }
+                    $notes.Add("baseline: $($b.Verdict)$(if ($b.Excused) { "; dirty at start: $($b.Excused -join ', ')" })")
+                }
+                catch { $notes.Add("baseline: could not re-grade dirty.json: $($_.Exception.Message)") }
+            }
             $note = $notes -join '; '
             $seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
         }
@@ -1301,8 +1438,9 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
             cadence       = $g.Cadence
             order         = $g.Order
             needs         = @($g.Needs)
+            baseline      = $baselineRec
         }
-        $rec | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $folder "$($g.Name).result.json")
+        $rec | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $folder "$($g.Name).result.json")
         $records.Add($rec)
         if ($result -in 'failed', 'refused' -or ($result -eq 'skipped' -and $unmet)) { $null = $blocked.Add($g.Name) }
         [pscustomobject]@{
@@ -1314,10 +1452,16 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
             Passed       = $rec.passed
             Failed       = $rec.failed
             Seconds      = $seconds
-            Verdict      = $verdictLine
+            Verdict      = if ($baselineRec) { "$($baselineRec.verdict) (baseline)" } else { $verdictLine }
             Note         = $note
         }
     })
+
+    $pin = Compare-FrameworkPin -Start $pinStart -End @(Get-FrameworkPin -Manifest $Manifest -ReposRoot $ReposRoot) -StartedAt $pinStartedAt -EndedAt (& $now)
+    $witness = -not $Baseline -and $pin.verdict -eq 'held'
+    $baselineBlock = if ($Baseline) {
+        [ordered]@{ read = 'working'; note = 'working read, not a witness: Dirty is unfit only for files not already dirty at start'; dirty_at_start = @($dirtyAtStart) }
+    }
 
     $children = @(foreach ($c in $Manifest.Children) {
         $file = Join-Path $usedRun.FullName "$($c.Name).result.json"
@@ -1329,6 +1473,7 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
         @($testRows | Where-Object Result -eq 'FAIL' | ForEach-Object { "test $($_.Name)" })
         @($verifyRows | Where-Object Verify -in 'does not', 'refused' | ForEach-Object { "verify $($_.Name)" })
         @($getterRows | Where-Object Result -in 'failed', 'refused' | ForEach-Object { "getter $($_.Name)" })
+        @($pin.torn | ForEach-Object { "torn: $_" })
     )
     $outcomes = [ordered]@{}
     foreach ($o in 'ok', 'failed', 'refused', 'skipped') { $outcomes[$o] = @($getterRows | Where-Object Result -eq $o).Count }
@@ -1342,13 +1487,16 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
         untested   = @($untested)
         env        = $envRecord
         previous   = if ($previous) { $previous.Name }
+        pin        = $pin
+        witness    = $witness
+        baseline   = $baselineBlock
         children  = $children
         verify    = @($verifyRows | ForEach-Object { [ordered]@{ name = $_.Name; verify = $_.Verify; commit = $_.Commit; seconds = $_.Seconds; note = $_.Note } })
         getters   = @($records)
         getter_outcomes = $outcomes
         diff      = $diffVerdict
         failures  = $failures
-    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $folder 'heartbeat.json')
+    } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $folder 'heartbeat.json')
 
     [pscustomobject]@{
         Folder     = $folder
@@ -1362,6 +1510,9 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
         Getters    = $getterRows
         Outcomes   = [pscustomobject]$outcomes
         Diff       = $diffVerdict
+        Pin        = $pin
+        Witness    = $witness
+        Baseline   = [bool]$Baseline
         Failures   = $failures
     }
 }

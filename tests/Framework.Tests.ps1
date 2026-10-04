@@ -1540,6 +1540,242 @@ getters:
     }
 }
 
+Describe 'Heartbeat pins each child' {
+    BeforeAll {
+        $schema = Join-Path $FrameworkRoot 'schema' 'heartbeat.schema.json'
+        # Errors from validating heartbeat.json against schema/heartbeat.schema.json; empty when it is valid.
+        function Get-SchemaErrors {
+            param([string]$Folder)
+            $e = @()
+            $ok = Test-Json -Json (Get-Content -LiteralPath (Join-Path $Folder 'heartbeat.json') -Raw) -SchemaFile $schema -ErrorAction SilentlyContinue -ErrorVariable e
+            if ($ok) { @() } else { @($e | ForEach-Object { "$_" }) + 'invalid' }
+        }
+        function New-PinRepo {
+            param([string]$Path, [hashtable]$Files)
+            foreach ($k in $Files.Keys) {
+                $file = Join-Path $Path $k
+                $null = New-Item -ItemType Directory -Path (Split-Path $file) -Force
+                Set-Content -LiteralPath $file -Value $Files[$k]
+            }
+            G $Path init --quiet --initial-branch=main | Out-Null
+            G $Path add -A | Out-Null
+            G $Path commit --quiet -m fixture | Out-Null
+            (& git -C $Path rev-parse HEAD)
+        }
+        $pRepos = Join-Path $RunRoot 'pin-repos'
+        $kidStart = New-PinRepo (Join-Path $pRepos 'Kid') @{ 'README.md' = 'kid' }
+        $otherHead = New-PinRepo (Join-Path $pRepos 'Other') @{ 'README.md' = 'other' }
+        # Move commits into Kid and leaves an untracked file in Other while the heartbeat runs; Still touches nothing.
+        $null = New-PinRepo (Join-Path $pRepos 'getters' 'Movers') @{
+            'tools/Move.ps1'  = @'
+param($Kid, $Other)
+Set-Content -LiteralPath (Join-Path $Kid 'mid.txt') -Value 'mid-run'
+$null = git -C $Kid add -- mid.txt 2>&1
+$null = git -C $Kid -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false commit --quiet -m mid-run 2>&1
+Set-Content -LiteralPath (Join-Path $Other 'loose.txt') -Value 'untracked'
+'moved'
+'@
+            'tools/Still.ps1' = "'still'"
+        }
+        $pYaml = {
+            param([string]$Name, [string]$Script, [string]$Verdict)
+            $p = Join-Path $RunRoot "pin-$Name.yaml"
+            Set-Content -LiteralPath $p -Value @"
+requirements:
+  pester: '$([string](Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Requirements.pester)'
+children:
+  - name: Kid
+    url: https://example.invalid/Kid.git
+    default_branch: main
+    branch: main
+    build_script: false
+  - name: Other
+    url: https://example.invalid/Other.git
+    default_branch: main
+    branch: main
+    build_script: false
+getters:
+  - name: $Name
+    path: getters/Movers
+    entry:
+      script: tools/$Script
+      parameters:
+        Kid: '{repos_root}\Kid'
+        Other: '{repos_root}\Other'
+    verdict: '$Verdict'
+    cadence: every
+    order: 1
+"@
+            Get-FrameworkManifest $p
+        }
+        $pFramework = Join-Path $RunRoot 'pin-framework'
+        $null = New-PinRepo $pFramework @{ '.gitignore' = '.framework/' }
+        $run = Join-Path $pFramework '.framework' 'test-runs' '20260101-000000-001'
+        $null = New-Item -ItemType Directory -Path $run -Force
+        Set-Content -LiteralPath (Join-Path $run 'summary.json') -Value (@{
+                partial = $false; only = @(); env = @{}
+                rows = @(@{ Name = 'Kid'; Result = 'no build script'; Verify = 'not applicable' }, @{ Name = 'Claude.Framework'; Result = 'pass'; Verify = 'not applicable' })
+            } | ConvertTo-Json -Depth 4)
+        $held = Invoke-FrameworkHeartbeat -Manifest (& $pYaml 'Still' 'Still.ps1' '^still$') -ReposRoot $pRepos -FrameworkRoot $pFramework -SkipUp
+        $tornManifest = & $pYaml 'Move' 'Move.ps1' '^moved$'
+        $torn = Invoke-FrameworkHeartbeat -Manifest $tornManifest -ReposRoot $pRepos -FrameworkRoot $pFramework -SkipUp
+        $kidEnd = Get-Head (Join-Path $pRepos 'Kid')
+        $read = { param($Hb) Get-Content -LiteralPath (Join-Path $Hb.Folder 'heartbeat.json') -Raw | ConvertFrom-Json }
+        $short = { param($Commit) $Commit.Substring(0, 7) }
+    }
+
+    It 'a heartbeat record carries a pin for every child, held, and validates against schema/heartbeat.schema.json' {
+        $rec = & $read $held
+        $rec.pin.verdict | Should -Be 'held'
+        @($rec.pin.children.repo) | Should -Be @('Kid', 'Other')
+        $kid = $rec.pin.children | Where-Object repo -eq 'Kid'
+        $kid.branch | Should -Be 'main'
+        $kid.commit | Should -Be $kidStart
+        $kid.dirty | Should -BeFalse
+        $kid.end.commit | Should -Be $kidStart
+        $kid.held | Should -BeTrue
+        @($rec.pin.torn).Count | Should -Be 0
+        $rec.witness | Should -BeTrue
+        $rec.baseline | Should -BeNullOrEmpty
+        $held.Failures | Should -BeNullOrEmpty
+        Get-SchemaErrors $held.Folder | Should -BeNullOrEmpty
+    }
+
+    It 'a child that commits mid-run tears the heartbeat: torn, naming the child and both commits, and the run fails' {
+        $kidEnd | Should -Not -Be $kidStart
+        $rec = & $read $torn
+        $rec.pin.verdict | Should -Be 'torn'
+        $kid = $rec.pin.children | Where-Object repo -eq 'Kid'
+        $kid.commit | Should -Be $kidStart
+        $kid.end.commit | Should -Be $kidEnd
+        $kid.held | Should -BeFalse
+        $line = "Kid $(& $short $kidStart) -> $(& $short $kidEnd)"
+        $rec.pin.torn | Should -Contain $line
+        $torn.Failures | Should -Contain "torn: $line"
+        $rec.witness | Should -BeFalse
+        ($torn.Getters | Where-Object Name -eq 'Move').Result | Should -Be 'ok'
+        Get-SchemaErrors $torn.Folder | Should -BeNullOrEmpty
+    }
+
+    It 'a dirty flag that flips mid-run tears it too: the same commit on both sides, the end one starred' {
+        $rec = & $read $torn
+        $other = $rec.pin.children | Where-Object repo -eq 'Other'
+        $other.commit | Should -Be $otherHead
+        $other.end.commit | Should -Be $otherHead
+        $other.dirty | Should -BeFalse
+        $other.end.dirty | Should -BeTrue
+        $torn.Failures | Should -Contain "torn: Other $(& $short $otherHead) -> $(& $short $otherHead)*"
+    }
+
+    It 'Status reads the pinned commit, not live HEAD: Pinned shows the tear, TestedAt is judged against the pin' {
+        # A run record for Kid at the pinned commit: live HEAD has moved past it, the pin has not.
+        $runs = Join-Path $RunRoot 'pin-runs'
+        $r = Join-Path $runs '20260101-000000-001'
+        $null = New-Item -ItemType Directory -Path $r -Force
+        Set-Content -LiteralPath (Join-Path $r 'Kid.result.json') -Value (@{ name = 'Kid'; task = 'Test'; commit = $kidStart } | ConvertTo-Json)
+        $rows = @(Get-FrameworkStatus -Manifest $tornManifest -ReposRoot $pRepos -RunsRoot $runs -HeartbeatsRoot (Join-Path $pFramework '.framework' 'heartbeats'))
+        $kid = $rows | Where-Object Name -eq 'Kid'
+        $kid.Pinned | Should -Be "$(& $short $kidStart) torn -> $(& $short $kidEnd)"
+        $kid.TestedAt | Should -Be (& $short $kidStart)
+        ($rows | Where-Object Name -eq 'Other').Pinned | Should -Be "$(& $short $otherHead) torn -> $(& $short $otherHead)*"
+        # Without a heartbeats root there is no pin, and TestedAt is judged against live HEAD as before.
+        (@(Get-FrameworkStatus -Manifest $tornManifest -ReposRoot $pRepos -RunsRoot $runs) | Where-Object Name -eq 'Kid').TestedAt | Should -Be "$(& $short $kidStart) stale"
+        $lines = @(Format-FrameworkGetterStatus (Join-Path $pFramework '.framework' 'heartbeats'))
+        $lines | Should -Contain "Pin: torn: Kid $(& $short $kidStart) -> $(& $short $kidEnd); Other $(& $short $otherHead) -> $(& $short $otherHead)*"
+    }
+}
+
+Describe 'Heartbeat -Baseline' {
+    BeforeAll {
+        # The real Dirty entry and its module, copied from repos\Claude.Modules into a fixture getter repo under the
+        # fixture Framework's own repos\, where Dirty looks for checkouts.
+        $mods = Join-Path $FrameworkRoot 'repos' 'Claude.Modules'
+        $pester = [string](Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Requirements.pester
+        $bFramework = Join-Path $RunRoot 'baseline-framework'
+        $bRepos = Join-Path $bFramework 'repos'
+        $bMods = Join-Path $bRepos 'Mods'
+        $bKid = Join-Path $bRepos 'Kid'
+        $children = "children:`n  - name: Kid`n    url: https://example.invalid/Kid.git`n    default_branch: main`n    branch: main`n    build_script: false`n"
+        $null = New-Item -ItemType Directory -Path (Join-Path $bMods 'tools'), (Join-Path $bMods 'modules'), $bKid -Force
+        Set-Content -LiteralPath (Join-Path $bFramework '.gitignore') -Value ".framework/`nrepos/"
+        Set-Content -LiteralPath (Join-Path $bFramework 'framework.yaml') -Value "requirements:`n  pester: '$pester'`n$children"
+        Set-Content -LiteralPath (Join-Path $bFramework 'pre.txt') -Value 'committed'
+        Copy-Item -LiteralPath (Join-Path $mods 'tools' 'Get-FrameworkDirty.ps1') -Destination (Join-Path $bMods 'tools')
+        Copy-Item -LiteralPath (Join-Path $mods 'modules' 'FrameworkDirty') -Destination (Join-Path $bMods 'modules') -Recurse
+        Set-Content -LiteralPath (Join-Path $bMods 'tools' 'Touch.ps1') -Value "param(`$Root) Set-Content -LiteralPath (Join-Path `$Root 'new.txt') -Value 'new'; 'touched'"
+        Set-Content -LiteralPath (Join-Path $bKid 'README.md') -Value 'kid'
+        foreach ($p in $bFramework, $bMods, $bKid) {
+            G $p init --quiet --initial-branch=main | Out-Null
+            G $p add -A | Out-Null
+            G $p commit --quiet -m fixture | Out-Null
+        }
+        # Dirty before the heartbeat starts, the way a slice's in-flight edits are.
+        Set-Content -LiteralPath (Join-Path $bFramework 'pre.txt') -Value 'edited before the heartbeat'
+        $run = Join-Path $bFramework '.framework' 'test-runs' '20260101-000000-001'
+        $null = New-Item -ItemType Directory -Path $run -Force
+        Set-Content -LiteralPath (Join-Path $run 'summary.json') -Value (@{
+                partial = $false; only = @(); env = @{}
+                rows = @(@{ Name = 'Kid'; Result = 'no build script'; Verify = 'not applicable' }, @{ Name = 'Claude.Framework'; Result = 'pass'; Verify = 'not applicable' })
+            } | ConvertTo-Json -Depth 4)
+        $dirtyRow = "  - name: Dirty`n    path: Mods`n    entry:`n      script: tools/Get-FrameworkDirty.ps1`n      parameters:`n        Root: '{framework_root}'`n        Out: '{out}'`n" +
+            "    outputs: [dirty.json, dirty.md]`n    verdict: '^\d+ clean, \d+ dirty, \d+ wrong-branch, \d+ nested, (ok|unfit)$'`n    cadence: every`n    order: 10"
+        $touchRow = "  - name: Touch`n    path: Mods`n    entry:`n      script: tools/Touch.ps1`n      parameters:`n        Root: '{framework_root}'`n    verdict: '^touched$'`n    cadence: every`n    order: 5"
+        $bYaml = { param($Name, $Rows) $p = Join-Path $RunRoot "baseline-$Name.yaml"; Set-Content -LiteralPath $p -Value "requirements:`n  pester: '$pester'`n${children}getters:`n$($Rows -join "`n")"; Get-FrameworkManifest $p }
+        $dirtyOnly = & $bYaml 'dirty' @($dirtyRow)
+        $bOn = Invoke-FrameworkHeartbeat -Manifest $dirtyOnly -ReposRoot $bRepos -FrameworkRoot $bFramework -SkipUp -Baseline
+        $bOff = Invoke-FrameworkHeartbeat -Manifest $dirtyOnly -ReposRoot $bRepos -FrameworkRoot $bFramework -SkipUp
+        # Touch runs before Dirty and writes a file into the Framework root that was not dirty at start.
+        $bNew = Invoke-FrameworkHeartbeat -Manifest (& $bYaml 'touch' @($touchRow, $dirtyRow)) -ReposRoot $bRepos -FrameworkRoot $bFramework -SkipUp -Baseline
+        $read = { param($Hb, $File = 'heartbeat.json') Get-Content -LiteralPath (Join-Path $Hb.Folder $File) -Raw | ConvertFrom-Json }
+        $schema = Join-Path $FrameworkRoot 'schema' 'heartbeat.schema.json'
+    }
+
+    It 'baseline mode excuses files already dirty at start: Dirty prints unfit, the baseline line is ok' {
+        $dirty = $bOn.Getters | Where-Object Name -eq 'Dirty'
+        $dirty.Result | Should -Be 'ok'
+        $rec = & $read $bOn 'Dirty.result.json'
+        $rec.verdict | Should -Be '2 clean, 1 dirty, 0 wrong-branch, 0 nested, unfit'
+        $rec.baseline.verdict | Should -Be '3 clean, 0 dirty, 0 wrong-branch, 0 nested, ok'
+        @($rec.baseline.excused) | Should -Be @('.')
+        $dirty.Verdict | Should -Be '3 clean, 0 dirty, 0 wrong-branch, 0 nested, ok (baseline)'
+        $bOn.Failures | Should -BeNullOrEmpty
+    }
+
+    It 'a baseline record is marked a working read, not a witness, with the files dirty at start, and validates' {
+        $hb = & $read $bOn
+        $hb.witness | Should -BeFalse
+        $hb.baseline.read | Should -Be 'working'
+        $hb.baseline.note | Should -BeLike 'working read, not a witness*'
+        @(($hb.baseline.dirty_at_start | Where-Object checkout -eq '.').files) | Should -Be @('pre.txt')
+        @(($hb.baseline.dirty_at_start | Where-Object checkout -eq 'repos/Kid').files).Count | Should -Be 0
+        $hb.pin.verdict | Should -Be 'held'
+        Test-Json -Json (Get-Content -LiteralPath (Join-Path $bOn.Folder 'heartbeat.json') -Raw) -SchemaFile $schema | Should -BeTrue
+    }
+
+    It 'without -Baseline the same tree is unfit, the record a witness with no baseline' {
+        $hb = & $read $bOff
+        $hb.witness | Should -BeTrue
+        $hb.baseline | Should -BeNullOrEmpty
+        ($bOff.Getters | Where-Object Name -eq 'Dirty').Verdict | Should -Be '2 clean, 1 dirty, 0 wrong-branch, 0 nested, unfit'
+        (& $read $bOff 'Dirty.result.json').baseline | Should -BeNullOrEmpty
+    }
+
+    It 'a file dirtied after the start still makes Dirty unfit under -Baseline, and is named' {
+        $rec = & $read $bNew 'Dirty.result.json'
+        $rec.baseline.verdict | Should -Be '2 clean, 1 dirty, 0 wrong-branch, 0 nested, unfit'
+        @($rec.baseline.excused).Count | Should -Be 0
+        $new = $rec.baseline.new_dirty | Where-Object checkout -eq '.'
+        @($new.files) | Should -Be @('new.txt')
+    }
+
+    It 'Status prints the baseline line for Dirty and marks the run a working read' {
+        $lines = @(Format-FrameworkGetterStatus (Join-Path $bFramework '.framework' 'heartbeats'))
+        $lines | Where-Object { $_ -match '^\s+Dirty\s' } | Should -Match 'ok\s+2 clean, 1 dirty, 0 wrong-branch, 0 nested, unfit \(baseline\)$'
+        $lines | Should -Contain 'Pin: held, 1 children'
+        $lines[-1] | Should -Be 'Baseline run: a working read, not a witness'
+    }
+}
+
 Describe 'Expected branch per child' {
     BeforeAll {
         $pester = [string](Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Requirements.pester
