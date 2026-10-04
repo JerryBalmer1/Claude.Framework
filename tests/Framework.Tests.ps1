@@ -317,6 +317,25 @@ Describe 'framework.yaml getters' {
         (Get-FrameworkManifest (Write-Getters 'no-verdict' $ok)).Getters[0].Verdict | Should -BeNullOrEmpty
         { Get-FrameworkManifest (Write-Getters 'bad-verdict' ($ok + "`n    verdict: '^(\d+ ok$'")) } | Should -Throw '*verdict is not a valid regex*'
     }
+
+    # The schemas are the one source of truth for verdict shape; framework.yaml copies them. Reads repos\, never writes.
+    # Diff and Shape print a line that is not a field of their JSON (diff.json keeps the call apart), so their schemas
+    # hold it as $defs.line; the others print their record's verdict field.
+    It '<Name>''s verdict regex equals the <Pointer> pattern in <Schema>' -ForEach @(
+        @{ Name = 'Dirty'; Schema = 'modules/FrameworkDirty/schema/dirty.schema.json'; Pointer = 'properties.verdict' }
+        @{ Name = 'Signs'; Schema = 'modules/FrameworkSigns/schema/signs.schema.json'; Pointer = 'properties.verdict' }
+        @{ Name = 'Shape'; Schema = 'modules/FrameworkShape/schema/graph.schema.json'; Pointer = '$defs.line' }
+        @{ Name = 'Secrets'; Schema = 'modules/FrameworkSecrets/schema/finding.schema.json'; Pointer = 'properties.verdict' }
+        @{ Name = 'Coverage'; Schema = 'modules/FrameworkCoverage/schema/coverage.schema.json'; Pointer = 'properties.verdict' }
+        @{ Name = 'Refusals'; Schema = 'modules/FrameworkRefusals/schema/refusals.schema.json'; Pointer = 'properties.verdict' }
+        @{ Name = 'Diff'; Schema = 'modules/FrameworkDiff/schema/diff.schema.json'; Pointer = '$defs.line' }
+    ) {
+        $g = (Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Getters | Where-Object Name -eq $Name
+        $node = Get-Content -LiteralPath (Join-Path $FrameworkRoot 'repos' $g.Path $Schema) -Raw | ConvertFrom-Json -AsHashtable
+        foreach ($k in $Pointer -split '\.') { $node = $node[$k] }
+        $node.pattern | Should -Not -BeNullOrEmpty
+        $g.Verdict | Should -BeExactly $node.pattern
+    }
 }
 
 Describe 'Heartbeat' {
@@ -1927,6 +1946,57 @@ Describe 'Sync' {
         $r.Action | Should -Be 'skipped'
         $r.Detail | Should -Match 'ahead'
         Get-Head $local | Should -Be $head
+    }
+}
+
+Describe 'Pester titles hold no stray angle brackets' {
+    BeforeAll {
+        # Pester expands <word> in an It, Describe or Context title from that block's -ForEach or -TestCases data, or an
+        # enclosing Describe's or Context's. A bracket outside such a template broke runs in four-g and four-h.
+        function Find-TitleTrap {
+            param([System.Management.Automation.Language.Ast]$Ast, [string]$File)
+            $blocks = $Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] -and $args[0].GetCommandName() -in 'It', 'Describe', 'Context' }, $true)
+            foreach ($b in $blocks) {
+                $title = $b.CommandElements | Select-Object -Skip 1 |
+                    Where-Object { $_ -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $_ -is [System.Management.Automation.Language.ExpandableStringExpressionAst] } |
+                    Select-Object -First 1
+                if (-not $title -or $title.Value -notmatch '[<>]') { continue }
+                # Keys a template may name: hashtable keys in the data of this block and every enclosing block.
+                $keys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                for ($p = $b; $p; $p = $p.Parent) {
+                    if ($p -isnot [System.Management.Automation.Language.CommandAst] -or $p.GetCommandName() -notin 'It', 'Describe', 'Context') { continue }
+                    $els = $p.CommandElements
+                    for ($i = 0; $i -lt $els.Count - 1; $i++) {
+                        if ($els[$i] -is [System.Management.Automation.Language.CommandParameterAst] -and $els[$i].ParameterName -in 'ForEach', 'TestCases') {
+                            foreach ($h in $els[$i + 1].FindAll({ $args[0] -is [System.Management.Automation.Language.HashtableAst] }, $true)) {
+                                foreach ($k in $h.KeyValuePairs) { [void]$keys.Add($k.Item1.Extent.Text.Trim('''"')) }
+                            }
+                        }
+                    }
+                }
+                $rest = [regex]::Replace($title.Value, '<([^<>]*)>', { param($m) if ($keys.Contains($m.Groups[1].Value)) { '' } else { $m.Value } })
+                if ($rest -match '[<>]') { [pscustomobject]@{ File = $File; Line = $title.Extent.StartLineNumber; Title = $title.Value } }
+            }
+        }
+    }
+
+    It 'no title under tests/ holds an angle bracket outside a template its data names' {
+        $traps = foreach ($f in Get-ChildItem (Join-Path $FrameworkRoot 'tests') -Recurse -Include *.ps1, *.psm1 -File) {
+            Find-TitleTrap ([System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)) $f.FullName
+        }
+        ($traps | ForEach-Object { "$($_.File):$($_.Line): $($_.Title)" }) -join "`n" | Should -BeNullOrEmpty
+    }
+
+    It 'the scan names a bare bracket word, an unknown template and a stray bracket, and passes a named template' {
+        $text = @(
+            "It 'refuses with refused: <reason>' { }"
+            "It 'reads <Name> and <Other>' -ForEach @(@{ Name = 'a' }) { }"
+            "Describe 'arrow -> on' { }"
+            "Describe 'D' -ForEach @(@{ Kind = 'k' }) { It '<Kind> and <Name>' -ForEach @(@{ 'Name' = 'n' }) { } }"
+        ) -join "`n"
+        $traps = @(Find-TitleTrap ([System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$null, [ref]$null)) 'sample')
+        $traps.Line | Should -Be @(1, 2, 3)
+        $traps[0].Title | Should -BeExactly 'refuses with refused: <reason>'
     }
 }
 

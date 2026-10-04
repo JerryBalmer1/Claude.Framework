@@ -100,6 +100,9 @@ children:
 #   path        relative to repos/; required unless entry is none
 #   verdict     a regex (case-sensitive) the last line the entry prints must match; required unless entry is none.
 #               A runnable getter without one is refused with "no verdict contract in framework.yaml" and never runs.
+#               Each regex is copied from the getter's schema in Claude.Modules, never written from module code: the
+#               pattern of properties.verdict, or of $defs.line for Shape and Diff, whose printed line is not a field
+#               of their JSON. A test holds each equal to its schema.
 # Optional: needs (getter names that must run first; one that failed or refused skips this getter with "needs <x>";
 # an unknown name or a cycle refuses the heartbeat before it starts), tests (true runs the getter's Pester, JUnit under
 # its output folder), expects (expected_failures or no_tests, each with reason), outputs (file names the entry must
