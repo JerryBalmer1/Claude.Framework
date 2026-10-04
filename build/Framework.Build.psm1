@@ -159,6 +159,66 @@ function ConvertTo-FrameworkGetters {
     $sorted
 }
 
+function Expand-FrameworkPlaceholder {
+    # $Text with each {key} in $Values replaced by its value. Non-strings pass through unchanged.
+    param($Text, [Parameter(Mandatory)][hashtable]$Values)
+    if ($Text -isnot [string]) { return $Text }
+    foreach ($t in $Values.Keys) { $Text = $Text.Replace("{$t}", [string]$Values[$t]) }
+    $Text
+}
+
+function ConvertTo-FrameworkEnv {
+    # The env list: process environment variables the build derives itself. Each entry has name, value (which may
+    # hold {framework_root} and {repos_root}) and wanted (file exists).
+    param($List)
+    if ($null -eq $List) { return @() }
+    $entries = @(foreach ($e in @($List)) {
+        if ($e -isnot [System.Collections.IDictionary]) { throw "Manifest env: each entry must be a mapping." }
+        foreach ($field in 'name', 'value', 'wanted') {
+            if (-not $e.Contains($field) -or "$($e[$field])" -eq '') { throw "Manifest env entry '$($e['name'])' is missing '$field'." }
+        }
+        $unknown = @($e.Keys | Where-Object { $_ -notin 'name', 'value', 'wanted' })
+        if ($unknown) { throw "Manifest env entry '$($e.name)': unknown key(s) $($unknown -join ', ')." }
+        if ("$($e.name)" -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { throw "Manifest env entry '$($e.name)': name is not an environment variable name." }
+        if ("$($e.wanted)" -ne 'file exists') { throw "Manifest env entry '$($e.name)': wanted must be 'file exists', not '$($e.wanted)'." }
+        [pscustomobject]@{ Name = [string]$e.name; Value = [string]$e.value; Wanted = [string]$e.wanted }
+    })
+    $dupes = $entries | Group-Object Name | Where-Object Count -gt 1
+    if ($dupes) { throw "Manifest has duplicate env names: $($dupes.Name -join ', ')" }
+    $entries
+}
+
+function Resolve-FrameworkEnv {
+    # Each env entry with its value derived from the roots: Name, Value, Wanted. FrameworkRoot defaults to the
+    # manifest's folder, ReposRoot to repos/ under it.
+    param([Parameter(Mandatory)]$Manifest, [string]$FrameworkRoot, [string]$ReposRoot)
+    if (-not $FrameworkRoot) { $FrameworkRoot = $Manifest.Root }
+    if (-not $ReposRoot) { $ReposRoot = Join-Path $FrameworkRoot 'repos' }
+    $values = @{ framework_root = $FrameworkRoot; repos_root = $ReposRoot }
+    foreach ($e in @($Manifest.Env)) {
+        [pscustomobject]@{ Name = $e.Name; Value = (Expand-FrameworkPlaceholder $e.Value $values); Wanted = $e.Wanted }
+    }
+}
+
+function Set-FrameworkEnv {
+    # Sets each env entry in this process only, so every child pwsh, Verify and getter inherits it. Writes nothing
+    # to User or Machine scope (Bootstrap does that). Returns Name, Value and Previous (what the shell had).
+    param([Parameter(Mandatory)]$Manifest, [string]$FrameworkRoot, [string]$ReposRoot)
+    foreach ($e in @(Resolve-FrameworkEnv -Manifest $Manifest -FrameworkRoot $FrameworkRoot -ReposRoot $ReposRoot)) {
+        $previous = [Environment]::GetEnvironmentVariable($e.Name, 'Process')
+        [Environment]::SetEnvironmentVariable($e.Name, $e.Value, 'Process')
+        [pscustomobject]@{ Name = $e.Name; Value = $e.Value; Wanted = $e.Wanted; Previous = $previous }
+    }
+}
+
+function Get-FrameworkEnvRecord {
+    # The env block a run record carries: each env entry's name and the value this process holds for it now.
+    param([Parameter(Mandatory)]$Manifest)
+    $o = [ordered]@{}
+    foreach ($e in @($Manifest.Env)) { $o[$e.Name] = [Environment]::GetEnvironmentVariable($e.Name, 'Process') }
+    $o
+}
+
 function Get-FrameworkManifest {
     param([Parameter(Mandatory)][string]$Path)
     Import-Module powershell-yaml -ErrorAction Stop
@@ -185,35 +245,39 @@ function Get-FrameworkManifest {
     $dupes = $children | Group-Object Name | Where-Object Count -gt 1
     if ($dupes) { throw "Manifest has duplicate names: $($dupes.Name -join ', ')" }
     [pscustomobject]@{
+        Root         = Split-Path (Resolve-Path -LiteralPath $Path).Path -Parent
         Requirements = $raw['requirements']
+        Env          = @(ConvertTo-FrameworkEnv $raw['env'])
         Children     = @($children)
         Getters      = @(ConvertTo-FrameworkGetters -List $raw['getters'] -ChildNames @($children | ForEach-Object Name))
     }
 }
 
 function Test-FrameworkRequirements {
-    # Returns one row per requirement. Presence only: nothing here runs docker.
-    param([Parameter(Mandatory)]$Manifest)
+    # Returns one row per requirement: Requirement, Wanted, Found, Ok, Note. Presence only: nothing here runs docker.
+    # Each env entry is derived from the roots and set in this process (never User or Machine scope); a stale shell
+    # value is noted, not failed. Only a missing file fails the row.
+    param([Parameter(Mandatory)]$Manifest, [string]$FrameworkRoot, [string]$ReposRoot)
     $req = $Manifest.Requirements
     $rows = [System.Collections.Generic.List[object]]::new()
+    $add = { param($Requirement, $Wanted, $Found, $Ok, $Note = '') $rows.Add([pscustomobject]@{ Requirement = $Requirement; Wanted = $Wanted; Found = $Found; Ok = [bool]$Ok; Note = $Note }) }
 
     $git = Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     $gitVer = if ($git) { ((& git --version) -replace '^git version\s*', '') } else { $null }
-    $rows.Add([pscustomobject]@{ Requirement = 'git'; Wanted = 'any'; Found = $gitVer ?? 'missing'; Ok = [bool]$git })
+    & $add 'git' 'any' ($gitVer ?? 'missing') $git
 
     $psWanted = [version]$req.powershell
-    $psOk = $PSVersionTable.PSVersion -ge $psWanted
-    $rows.Add([pscustomobject]@{ Requirement = 'PowerShell'; Wanted = ">= $psWanted"; Found = "$($PSVersionTable.PSVersion)"; Ok = $psOk })
+    & $add 'PowerShell' ">= $psWanted" "$($PSVersionTable.PSVersion)" ($PSVersionTable.PSVersion -ge $psWanted)
 
     foreach ($m in @(@{ Name = 'Pester'; Key = 'pester' }, @{ Name = 'powershell-yaml'; Key = 'powershell_yaml' })) {
         $wanted = [version]$req[$m.Key]
         $found = Get-Module -ListAvailable -Name $m.Name | Where-Object Version -eq $wanted | Select-Object -First 1
         $all = (Get-Module -ListAvailable -Name $m.Name | ForEach-Object { "$($_.Version)" } | Sort-Object -Unique) -join ', '
-        $rows.Add([pscustomobject]@{ Requirement = $m.Name; Wanted = "= $wanted"; Found = if ($all) { $all } else { 'missing' }; Ok = [bool]$found })
+        & $add $m.Name "= $wanted" $(if ($all) { $all } else { 'missing' }) $found
     }
 
     $docker = Get-Command docker -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    $rows.Add([pscustomobject]@{ Requirement = 'Docker'; Wanted = 'present'; Found = if ($docker) { $docker.Source } else { 'missing' }; Ok = [bool]$docker })
+    & $add 'Docker' 'present' $(if ($docker) { $docker.Source } else { 'missing' }) $docker
 
     # Compose v2 ships as a CLI plugin next to docker or as a standalone docker-compose binary.
     $compose = Get-Command docker-compose -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -223,19 +287,20 @@ function Test-FrameworkRequirements {
         $plugin = Join-Path (Split-Path (Split-Path $docker.Source)) 'cli-plugins' $exe
         if (Test-Path -LiteralPath $plugin) { $composePath = $plugin }
     }
-    $rows.Add([pscustomobject]@{ Requirement = 'Docker Compose'; Wanted = 'present'; Found = $composePath ?? 'missing'; Ok = [bool]$composePath })
+    & $add 'Docker Compose' 'present' ($composePath ?? 'missing') $composePath
 
-    # Claude.Chain's ledger file. Reported, not created.
-    $ledger = $env:CLAUDE_CHAIN_LEDGER
-    $ledgerOk = [bool]$ledger -and (Test-Path -LiteralPath $ledger -PathType Leaf)
-    $rows.Add([pscustomobject]@{ Requirement = 'CLAUDE_CHAIN_LEDGER'; Wanted = 'file exists'; Found = if ($ledger) { $ledger } else { '(unset)' }; Ok = $ledgerOk })
+    # Derived files such as Claude.Chain's ledger. Reported, not created.
+    foreach ($e in @(Set-FrameworkEnv -Manifest $Manifest -FrameworkRoot $FrameworkRoot -ReposRoot $ReposRoot)) {
+        $note = if ($null -eq $e.Previous -or $e.Previous -eq '') { 'shell unset' } elseif ($e.Previous -ne $e.Value) { "shell had $($e.Previous)" } else { '' }
+        & $add $e.Name $e.Wanted $e.Value (Test-Path -LiteralPath $e.Value -PathType Leaf) $note
+    }
 
     # Ok when this process can import the module, not merely when a copy is on disk.
     $ibVersions = @(@(Get-Module -ListAvailable -Name InvokeBuild) + @(Get-Module -Name InvokeBuild) |
             ForEach-Object { "$($_.Version)" } | Sort-Object -Unique)
     $ibOk = [bool](Get-Module -Name InvokeBuild)
     if (-not $ibOk) { try { Import-Module InvokeBuild -ErrorAction Stop; $ibOk = $true } catch { $ibOk = $false } }
-    $rows.Add([pscustomobject]@{ Requirement = 'Invoke-Build'; Wanted = 'present'; Found = if ($ibVersions) { $ibVersions -join ', ' } else { 'missing' }; Ok = $ibOk })
+    & $add 'Invoke-Build' 'present' $(if ($ibVersions) { $ibVersions -join ', ' } else { 'missing' }) $ibOk
 
     $rows
 }
@@ -361,13 +426,16 @@ function Format-ShortCommit {
 }
 
 function Get-LatestRunRecord {
-    # The <Name>.result.json in the newest run folder that has one, or $null.
+    # The <Name>.result.json in the newest run folder that has one, or $null. A record Verify wrote where Test had
+    # left none (task: none) says nothing about what was tested and is passed over.
     param([string]$RunsRoot, [Parameter(Mandatory)][string]$Name)
     if (-not $RunsRoot -or -not (Test-Path -LiteralPath $RunsRoot)) { return $null }
     $folders = Get-ChildItem -LiteralPath $RunsRoot -Directory | Where-Object Name -match '^\d{8}-\d{6}-\d{3}$' | Sort-Object Name -Descending
     foreach ($f in $folders) {
         $file = Join-Path $f.FullName "$Name.result.json"
-        if (Test-Path -LiteralPath $file) { return Get-Content -LiteralPath $file -Raw | ConvertFrom-Json }
+        if (-not (Test-Path -LiteralPath $file)) { continue }
+        $record = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
+        if ($record.task -ne 'none') { return $record }
     }
     $null
 }
@@ -571,7 +639,15 @@ function Get-TestVerdict {
 function New-FrameworkRunFolder {
     # Creates <Root>/<yyyyMMdd-HHmmss-fff> and removes the oldest run folders so that $Keep remain, the new one
     # included. CLAUDE.md names this as the one place Framework deletes; only folders named like a stamp are touched.
-    param([Parameter(Mandatory)][string]$Root, [int]$Keep = 5)
+    # Folders named in -Protect are never removed. With -PruneLog, a folder lacking -RequireFile (summary.json for
+    # test runs) is removed only after a line naming it is appended to that log.
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [int]$Keep = 5,
+        [string[]]$Protect = @(),
+        [string]$PruneLog,
+        [string]$RequireFile = 'summary.json'
+    )
     if ($Keep -lt 1) { throw "Keep must be at least 1." }
     if (-not (Test-Path -LiteralPath $Root)) { $null = New-Item -ItemType Directory -Path $Root -Force }
     do {
@@ -579,9 +655,40 @@ function New-FrameworkRunFolder {
     } while (Test-Path -LiteralPath $path)
     $null = New-Item -ItemType Directory -Path $path
     $old = @(Get-ChildItem -LiteralPath $Root -Directory | Where-Object Name -match '^\d{8}-\d{6}-\d{3}$' |
-            Sort-Object Name -Descending | Select-Object -Skip $Keep)
-    foreach ($d in $old) { Remove-Item -LiteralPath $d.FullName -Recurse -Force }
+            Sort-Object Name -Descending | Select-Object -Skip $Keep | Where-Object Name -notin @($Protect))
+    foreach ($d in $old) {
+        if ($PruneLog -and -not (Test-Path -LiteralPath (Join-Path $d.FullName $RequireFile))) {
+            Add-Content -LiteralPath $PruneLog -Value "$(Get-Date -Format o) pruned $($d.FullName): no $RequireFile" -ErrorAction Stop
+        }
+        Remove-Item -LiteralPath $d.FullName -Recurse -Force
+    }
     [pscustomobject]@{ Path = $path; Pruned = @($old | ForEach-Object Name) }
+}
+
+function Get-HeartbeatReusedRun {
+    # The test-run folder name the newest heartbeat.json under $HeartbeatsRoot reused, or $null. Reads reused_run,
+    # or test_run.folder from a record written before reused_run existed.
+    param([string]$HeartbeatsRoot)
+    if (-not $HeartbeatsRoot -or -not (Test-Path -LiteralPath $HeartbeatsRoot)) { return $null }
+    $folders = Get-ChildItem -LiteralPath $HeartbeatsRoot -Directory | Where-Object Name -match '^\d{8}-\d{6}-\d{3}$' | Sort-Object Name -Descending
+    foreach ($f in $folders) {
+        $file = Join-Path $f.FullName 'heartbeat.json'
+        if (-not (Test-Path -LiteralPath $file)) { continue }
+        $hb = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
+        if ($hb.PSObject.Properties['reused_run']) { return $hb.reused_run }
+        if ($hb.test_run -and $hb.test_run.reused) { return $hb.test_run.folder }
+        return $null
+    }
+    $null
+}
+
+function New-FrameworkTestRunFolder {
+    # A test-runs folder under $StateRoot, pruned to $Keep: the run the newest heartbeat reused is kept, and a
+    # summary-less folder is logged to <StateRoot>/prune.log before it goes.
+    param([Parameter(Mandatory)][string]$StateRoot, [int]$Keep = 5)
+    if (-not (Test-Path -LiteralPath $StateRoot)) { $null = New-Item -ItemType Directory -Path $StateRoot -Force }
+    $protect = @(Get-HeartbeatReusedRun (Join-Path $StateRoot 'heartbeats') | Where-Object { $_ })
+    New-FrameworkRunFolder -Root (Join-Path $StateRoot 'test-runs') -Keep $Keep -Protect $protect -PruneLog (Join-Path $StateRoot 'prune.log')
 }
 
 function Get-FrameworkTestPlan {
@@ -605,13 +712,16 @@ function Get-FrameworkTestPlan {
 function Write-ChildRunRecord {
     # <Name>.result.json next to the child's JUnit file: what was tested (commit, dirty, branch, when, which task),
     # what was expected, what happened. verify is ran, skipped (left to Heartbeat) or not applicable; verify_outcome
-    # is reproduces or does not when it ran.
+    # is reproduces or does not when it ran. env is each manifest env entry's value at run time; partial is true
+    # when the run used -Only.
     param(
         [Parameter(Mandatory)][string]$RunFolder,
         [Parameter(Mandatory)]$Row,
         [Parameter(Mandatory)]$Checkout,
         [Parameter(Mandatory)][string]$TestedAt,
-        $Expect
+        $Expect,
+        [System.Collections.IDictionary]$Env = [ordered]@{},
+        [bool]$Partial
     )
     [ordered]@{
         name      = $Row.Name
@@ -627,6 +737,8 @@ function Write-ChildRunRecord {
         verify_outcome = if ($Row.Verify -in 'reproduces', 'does not') { $Row.Verify }
         seconds   = $Row.Seconds
         note      = $Row.Note
+        env       = $Env
+        partial   = $Partial
     } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $RunFolder "$($Row.Name).result.json")
 }
 
@@ -634,7 +746,9 @@ function Invoke-FrameworkTest {
     # Runs every child that has a build script through its own test task in a fresh pwsh, then Framework's SelfTest.
     # -Only runs just those names; every child still gets a row. -Full runs full_test_task where one is declared.
     # Verify is Heartbeat's: a child that declares it shows 'heartbeat' unless -Verify runs it here.
-    # Results, logs, JUnit files and one <Name>.result.json per tested child go to .framework/test-runs/<stamp>/.
+    # Results, logs, JUnit files and one <Name>.result.json per tested child go to <StateRoot>/test-runs/<stamp>/;
+    # StateRoot defaults to <FrameworkRoot>/.framework. Each env entry is set in this process first, so children
+    # inherit the derived value, not the shell's. summary.json and every record carry env, and partial when -Only.
     param(
         [Parameter(Mandatory)]$Manifest,
         [Parameter(Mandatory)][string]$ReposRoot,
@@ -642,11 +756,17 @@ function Invoke-FrameworkTest {
         [string[]]$Only,
         [switch]$Full,
         [switch]$Verify,
-        [int]$KeepRuns = 5
+        [int]$KeepRuns = 5,
+        [string]$StateRoot
     )
+    if (-not $StateRoot) { $StateRoot = Join-Path $FrameworkRoot '.framework' }
     $plan = @(Get-FrameworkTestPlan -Manifest $Manifest -Only $Only -Full:$Full -Verify:$Verify)
     $pester = [string]$Manifest.Requirements.pester
-    $run = (New-FrameworkRunFolder -Root (Join-Path $FrameworkRoot '.framework' 'test-runs') -Keep $KeepRuns).Path
+    $null = Set-FrameworkEnv -Manifest $Manifest -FrameworkRoot $FrameworkRoot -ReposRoot $ReposRoot
+    $envRecord = Get-FrameworkEnvRecord -Manifest $Manifest
+    $partial = [bool]@($Only | Where-Object { $_ }).Count
+    $run = (New-FrameworkTestRunFolder -StateRoot $StateRoot -Keep $KeepRuns).Path
+    $stamp = Split-Path $run -Leaf
     $row = {
         param($Name, $Result, $Expected, $Counts, $Verify, $Seconds, $Note, $Task = '-', $Checkout = $null)
         [pscustomobject]@{
@@ -685,7 +805,7 @@ function Invoke-FrameworkTest {
         }
         if ($before) {
             $r = & $row $c.Name 'FAIL' $expected $null $verifyCol ([math]::Round($sw.Elapsed.TotalSeconds, 1)) $before $task $checkout
-            Write-ChildRunRecord -RunFolder $run -Row $r -Checkout $checkout -TestedAt $testedAt -Expect $e
+            Write-ChildRunRecord -RunFolder $run -Row $r -Checkout $checkout -TestedAt $testedAt -Expect $e -Env $envRecord -Partial $partial
             $r
             continue
         }
@@ -719,7 +839,7 @@ function Invoke-FrameworkTest {
             $note = (@($note, $v.Note) | Where-Object { $_ }) -join '; '
         }
         $r = & $row $c.Name $verdict.Result $expected $counts $verifyCol ([math]::Round($sw.Elapsed.TotalSeconds, 1)) $note $task $checkout
-        Write-ChildRunRecord -RunFolder $run -Row $r -Checkout $checkout -TestedAt $testedAt -Expect $e
+        Write-ChildRunRecord -RunFolder $run -Row $r -Checkout $checkout -TestedAt $testedAt -Expect $e -Env $envRecord -Partial $partial
         $r
     })
 
@@ -731,17 +851,39 @@ function Invoke-FrameworkTest {
         $sw = [Diagnostics.Stopwatch]::StartNew()
         $junit = Join-Path $run 'Claude.Framework.junit.xml'
         $exit = Invoke-ChildTask -Path $FrameworkRoot -Task $self.Task -LogFile (Join-Path $run 'Claude.Framework.log') -ResultFile $junit `
-            -PesterVersion $pester -Environment @{ FRAMEWORK_FIXTURE_ROOT = (Join-Path $run 'fixtures') }
+            -PesterVersion $pester -Environment @{ FRAMEWORK_FIXTURE_ROOT = (Join-Path $StateRoot 'fixtures' $stamp) }
         $counts = Read-JUnitCounts $junit
         $verdict = Get-TestVerdict -ExitCode $exit -Counts $counts -Expect $selfExpect
         $r = & $row 'Claude.Framework' $verdict.Result '0 failed' $counts 'not applicable' ([math]::Round($sw.Elapsed.TotalSeconds, 1)) $verdict.Note $self.Task $checkout
-        Write-ChildRunRecord -RunFolder $run -Row $r -Checkout $checkout -TestedAt $testedAt -Expect $selfExpect
+        Write-ChildRunRecord -RunFolder $run -Row $r -Checkout $checkout -TestedAt $testedAt -Expect $selfExpect -Env $envRecord -Partial $partial
         $rows += $r
     }
     else { $rows += & $row 'Claude.Framework' 'skipped (-Only)' '0 failed' $null 'not applicable' $null $null $self.Task }
 
-    $rows | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $run 'summary.json')
+    [ordered]@{ partial = $partial; only = @($Only | Where-Object { $_ }); env = $envRecord; rows = $rows } |
+        ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $run 'summary.json')
     $rows
+}
+
+function Read-TestRunSummary {
+    # A test-run folder as Heartbeat reuses it: Rows, Partial, Env and HasSummary. summary.json is an object with rows,
+    # or, before slice four-b, the bare rows array, where a 'skipped (-Only)' row marks the run partial. With no
+    # summary.json the rows come from the result.json files Test left (task: none records excluded).
+    param([Parameter(Mandatory)][string]$Path)
+    $file = Join-Path $Path 'summary.json'
+    if (Test-Path -LiteralPath $file) {
+        $raw = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json -NoEnumerate
+        if ($raw -is [array]) {
+            $rows = @($raw)
+            return [pscustomobject]@{ Rows = $rows; Partial = [bool]@($rows | Where-Object Result -eq 'skipped (-Only)').Count; Env = $null; HasSummary = $true }
+        }
+        return [pscustomobject]@{ Rows = @($raw.rows); Partial = [bool]$raw.partial; Env = $raw.env; HasSummary = $true }
+    }
+    $rows = @(Get-ChildItem -LiteralPath $Path -Filter '*.result.json' -File | ForEach-Object {
+            $r = Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json
+            if ($r.task -ne 'none') { [pscustomobject]@{ Name = $r.name; Task = $r.task; Result = $r.result; Verify = $r.verify } }
+        })
+    [pscustomobject]@{ Rows = $rows; Partial = $true; Env = $null; HasSummary = $false }
 }
 
 function Get-StampFolders {
@@ -786,11 +928,7 @@ function Get-GetterInvocation {
     # that records what ran.
     param([Parameter(Mandatory)]$Entry, [Parameter(Mandatory)][hashtable]$Values)
     $params = [ordered]@{}
-    foreach ($k in $Entry.Parameters.Keys) {
-        $v = $Entry.Parameters[$k]
-        if ($v -is [string]) { foreach ($t in $Values.Keys) { $v = $v.Replace("{$t}", [string]$Values[$t]) } }
-        $params[$k] = $v
-    }
+    foreach ($k in $Entry.Parameters.Keys) { $params[$k] = Expand-FrameworkPlaceholder $Entry.Parameters[$k] $Values }
     $parts = foreach ($k in $params.Keys) {
         $v = $params[$k]
         if ($v -is [bool]) { if ($v) { "-$k" } else { "-${k}:`$false" } }
@@ -806,6 +944,9 @@ function Invoke-FrameworkHeartbeat {
     # <getter>.result.json per getter go to .framework/heartbeats/<stamp>/, which keeps the latest -KeepRuns folders;
     # heartbeat.json at its root is the record. -Only names children and/or getters; anything not named is skipped.
     # Failures lists every getter fail, child Test FAIL and Verify 'does not'; the build fails the task on any.
+    # A reused run (-SkipUp, or -Only naming no child) must be the newest test run, with summary.json and not partial;
+    # -AllowPartial accepts a partial or summary-less one and the record says partial with the children left untested.
+    # StateRoot (default <FrameworkRoot>/.framework) holds test-runs/ and heartbeats/.
     param(
         [Parameter(Mandatory)]$Manifest,
         [Parameter(Mandatory)][string]$ReposRoot,
@@ -813,8 +954,11 @@ function Invoke-FrameworkHeartbeat {
         [string[]]$Only,
         [switch]$Full,
         [switch]$SkipUp,
-        [int]$KeepRuns = 5
+        [switch]$AllowPartial,
+        [int]$KeepRuns = 5,
+        [string]$StateRoot
     )
+    if (-not $StateRoot) { $StateRoot = Join-Path $FrameworkRoot '.framework' }
     $getters = @($Manifest.Getters)
     $childNames = @($Manifest.Children | ForEach-Object Name) + 'Claude.Framework'
     $valid = $childNames + @($getters | ForEach-Object Name)
@@ -823,16 +967,27 @@ function Invoke-FrameworkHeartbeat {
     $selected = { param($n) -not $Only -or $n -in $Only }
     $onlyChildren = @($Only | Where-Object { $_ -in $childNames })
     $pester = [string]$Manifest.Requirements.pester
-    $runsRoot = Join-Path $FrameworkRoot '.framework' 'test-runs'
-    $hbRoot = Join-Path $FrameworkRoot '.framework' 'heartbeats'
+    $runsRoot = Join-Path $StateRoot 'test-runs'
+    $hbRoot = Join-Path $StateRoot 'heartbeats'
     $now = { [DateTimeOffset]::Now.ToString('yyyy-MM-ddTHH:mm:sszzz') }
+    $null = Set-FrameworkEnv -Manifest $Manifest -FrameworkRoot $FrameworkRoot -ReposRoot $ReposRoot
+    $envRecord = Get-FrameworkEnvRecord -Manifest $Manifest
+    # The names a full Test runs: children with a build script, and Claude.Framework.
+    $testable = @(@($Manifest.Children | Where-Object BuildScript | ForEach-Object Name) + 'Claude.Framework')
+    $untestedIn = { param($Rows) @($testable | Where-Object { $n = $_; -not ($Rows | Where-Object { $_.Name -eq $n -and $_.Result -ne 'skipped (-Only)' }) }) }
 
-    # Checked before the heartbeat folder exists, so a run with nothing to reuse leaves nothing behind.
+    # Checked before the heartbeat folder exists, so a run with nothing to reuse, or one refused, leaves nothing behind.
     $reuse = if ($SkipUp) { '-SkipUp' } elseif ($Only -and -not $onlyChildren) { '-Only names no child' }
     $usedRun = $null
+    $summary = $null
     if ($reuse) {
-        $usedRun = Get-StampFolders $runsRoot | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'summary.json') } | Select-Object -First 1
-        if (-not $usedRun) { throw "Heartbeat ($reuse): no test run with a summary.json under $runsRoot to reuse; run Test first." }
+        $usedRun = Get-StampFolders $runsRoot | Select-Object -First 1
+        if (-not $usedRun) { throw "Heartbeat ($reuse): no test run under $runsRoot to reuse; run Invoke-Build Test first." }
+        $summary = Read-TestRunSummary $usedRun.FullName
+        $why = if (-not $summary.HasSummary) { 'has no summary.json' } elseif ($summary.Partial) { 'is partial (Test ran with -Only)' }
+        if ($why -and -not $AllowPartial) {
+            throw "Heartbeat ($reuse): the newest test run $($usedRun.FullName) $why. Run Invoke-Build Test, then Heartbeat -SkipUp; or pass -AllowPartial to reuse it and record it as partial."
+        }
     }
 
     # When each weekly getter last ran, from the heartbeats kept so far.
@@ -849,13 +1004,14 @@ function Invoke-FrameworkHeartbeat {
     $stamp = Split-Path $folder -Leaf
     $previous = Get-StampFolders $hbRoot | Where-Object Name -ne $stamp | Select-Object -First 1
 
-    if ($reuse) {
-        $testRows = @(Get-Content -LiteralPath (Join-Path $usedRun.FullName 'summary.json') -Raw | ConvertFrom-Json)
-    }
-    else {
-        $testRows = @(Invoke-FrameworkTest -Manifest $Manifest -ReposRoot $ReposRoot -FrameworkRoot $FrameworkRoot -Only $onlyChildren -Full:$Full -KeepRuns $KeepRuns)
+    if (-not $reuse) {
+        $null = Invoke-FrameworkTest -Manifest $Manifest -ReposRoot $ReposRoot -FrameworkRoot $FrameworkRoot -Only $onlyChildren -Full:$Full -KeepRuns $KeepRuns -StateRoot $StateRoot
         $usedRun = Get-StampFolders $runsRoot | Select-Object -First 1
+        $summary = Read-TestRunSummary $usedRun.FullName
     }
+    $testRows = @($summary.Rows)
+    $partial = [bool]$summary.Partial
+    $untested = if ($partial) { & $untestedIn $testRows } else { @() }
 
     $verifyRows = @(foreach ($c in @($Manifest.Children | Where-Object { $_.Verify -and $_.BuildScript })) {
         $vr = { param($Result, $Commit, $Seconds, $Note) [pscustomobject]@{ Name = $c.Name; Verify = $Result; Commit = $Commit; Seconds = $Seconds; Note = $Note } }
@@ -870,7 +1026,24 @@ function Invoke-FrameworkHeartbeat {
         $note = $v.Note
         $record = Join-Path $usedRun.FullName "$($c.Name).result.json"
         if (Test-Path -LiteralPath $record) { Set-RunRecordVerify -Path $record -Outcome $v.Verify -By "heartbeat $stamp" }
-        else { $note += "; test run $($usedRun.Name) has no $($c.Name).result.json to update" }
+        else {
+            # Test did not run this child here (-Only); the record says so with task: none and carries the verify.
+            [ordered]@{
+                name           = $c.Name
+                task           = 'none'
+                commit         = $checkout.Commit
+                dirty          = $checkout.Dirty
+                branch         = $checkout.Branch
+                tested_at      = $null
+                result         = 'not tested'
+                verify         = 'ran'
+                verify_outcome = $v.Verify
+                verify_by      = "heartbeat $stamp"
+                env            = $envRecord
+                partial        = $partial
+            } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $record
+            $note += "; test run $($usedRun.Name) had no $($c.Name).result.json; wrote one with task: none"
+        }
         & $vr $v.Verify (Format-ShortCommit $checkout.Commit $checkout.Dirty) ([math]::Round($sw.Elapsed.TotalSeconds, 1)) $note
     })
 
@@ -987,10 +1160,14 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
     )
     $testRun = [ordered]@{ folder = $usedRun.Name; reused = [bool]$reuse; reason = $reuse }
     [ordered]@{
-        stamp     = $stamp
-        framework = [ordered]@{ commit = if ($graded) { $graded.Commit }; dirty = if ($graded) { $graded.Dirty }; branch = if ($graded) { $graded.Branch } }
-        test_run  = $testRun
-        previous  = if ($previous) { $previous.Name }
+        stamp      = $stamp
+        framework  = [ordered]@{ commit = if ($graded) { $graded.Commit }; dirty = if ($graded) { $graded.Dirty }; branch = if ($graded) { $graded.Branch } }
+        test_run   = $testRun
+        reused_run = if ($reuse) { $usedRun.Name }
+        partial    = $partial
+        untested   = @($untested)
+        env        = $envRecord
+        previous   = if ($previous) { $previous.Name }
         children  = $children
         verify    = @($verifyRows | ForEach-Object { [ordered]@{ name = $_.Name; verify = $_.Verify; commit = $_.Commit; seconds = $_.Seconds; note = $_.Note } })
         getters   = @($records)
@@ -1002,6 +1179,9 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
         Folder     = $folder
         Stamp      = $stamp
         TestRun    = [pscustomobject]$testRun
+        Partial    = $partial
+        Untested   = @($untested)
+        Env        = $envRecord
         TestRows   = $testRows
         VerifyRows = $verifyRows
         Getters    = $getterRows
@@ -1012,22 +1192,26 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
 
 function Invoke-FrameworkBootstrap {
     # Runs the run-once script unless <StateRoot>/bootstrap.done exists; -Force runs it again. The marker is
-    # written only after the script succeeds, and records when it ran and which script.
+    # written only after the script succeeds, and records when it ran and which script. -Environment (name to value,
+    # the resolved env entries) is passed to the script only when it holds something. Lines is what the script printed.
     param(
         [Parameter(Mandatory)][string]$StateRoot,
         [Parameter(Mandatory)][string]$Script,
+        [System.Collections.IDictionary]$Environment,
         [switch]$Force
     )
     $marker = Join-Path $StateRoot 'bootstrap.done'
     if ((Test-Path -LiteralPath $marker) -and -not $Force) {
-        return [pscustomobject]@{ Action = 'skipped'; Detail = "marker exists: $(Get-Content -LiteralPath $marker -Raw)".Trim() }
+        return [pscustomobject]@{ Action = 'skipped'; Detail = "marker exists: $(Get-Content -LiteralPath $marker -Raw)".Trim(); Lines = @() }
     }
     if (-not (Test-Path -LiteralPath $StateRoot)) { $null = New-Item -ItemType Directory -Path $StateRoot -Force }
-    & $Script -StateRoot $StateRoot
+    $splat = @{ StateRoot = $StateRoot }
+    if ($Environment -and $Environment.Count) { $splat.Environment = $Environment }
+    $lines = @(& $Script @splat | ForEach-Object { "$_" })
     Set-Content -LiteralPath $marker -Value "$(Get-Date -Format o) $Script"
-    [pscustomobject]@{ Action = if ($Force) { 'ran (-Force)' } else { 'ran' }; Detail = "marker written: $marker" }
+    [pscustomobject]@{ Action = if ($Force) { 'ran (-Force)' } else { 'ran' }; Detail = "marker written: $marker"; Lines = $lines }
 }
 
 Export-ModuleMember -Function Get-FrameworkManifest, Test-FrameworkRequirements, Sync-Framework, Sync-FrameworkChild,
     Get-FrameworkStatus, Get-FrameworkTestPlan, Invoke-FrameworkTest, Invoke-ChildTask, Invoke-ChildVerify, Get-TestVerdict,
-    New-FrameworkRunFolder, Invoke-FrameworkBootstrap, Invoke-FrameworkHeartbeat
+    New-FrameworkRunFolder, Invoke-FrameworkBootstrap, Invoke-FrameworkHeartbeat, Resolve-FrameworkEnv, Get-HeartbeatReusedRun

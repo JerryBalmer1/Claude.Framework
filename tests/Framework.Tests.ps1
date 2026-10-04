@@ -1,7 +1,8 @@
 #Requires -Version 7.4
-# Fixtures are local bare repos and fixture children under .framework/test-runs/<stamp>/ (gitignored, inside the
-# repo), or under $env:FRAMEWORK_FIXTURE_ROOT when the Test task runs this suite. No network. Old run folders are
-# pruned by New-FrameworkRunFolder, the one deletion CLAUDE.md allows.
+# Fixtures are local bare repos and fixture children under .framework/fixtures/<stamp>/ (gitignored, inside the
+# repo), or under $env:FRAMEWORK_FIXTURE_ROOT when the Test task runs this suite. No network. Nothing here writes
+# to .framework/test-runs/ or .framework/heartbeats/, so a test run never takes a retention slot from a real run;
+# every run and heartbeat folder a test makes is under a fixture root. Fixture folders are not pruned.
 
 BeforeDiscovery {
     # The -ForEach data below reads the manifest at discovery time.
@@ -15,7 +16,7 @@ BeforeAll {
     $RunRoot = if ($env:FRAMEWORK_FIXTURE_ROOT) {
         (New-Item -ItemType Directory -Path $env:FRAMEWORK_FIXTURE_ROOT -Force).FullName
     }
-    else { (New-FrameworkRunFolder -Root (Join-Path $FrameworkRoot '.framework' 'test-runs')).Path }
+    else { (New-Item -ItemType Directory -Path (Join-Path $FrameworkRoot '.framework' 'fixtures' (Get-Date -Format 'yyyyMMdd-HHmmss-fff')) -Force).FullName }
 
     function G { param([string]$Path) $out = & git -C $Path -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false @args 2>&1; if ($LASTEXITCODE) { throw "git $args : $out" }; $out }
 
@@ -201,13 +202,17 @@ Describe 'Heartbeat' {
             G $Path commit --quiet -m fixture | Out-Null
             (& git -C $Path rev-parse HEAD)
         }
-        # A test run to reuse, the way Test leaves one: summary.json and a record per child.
+        # A test run to reuse, the way Test leaves one: summary.json with partial, env and rows.
         function New-FakeTestRun {
-            param([string]$Root, [string]$Stamp, [switch]$NoSummary)
+            param([string]$Root, [string]$Stamp, [switch]$NoSummary, [switch]$Partial)
             $run = Join-Path $Root '.framework' 'test-runs' $Stamp
             $null = New-Item -ItemType Directory -Path $run -Force
             if (-not $NoSummary) {
-                Set-Content -LiteralPath (Join-Path $run 'summary.json') -Value '[{"Name":"Kid","Result":"no build script","Verify":"not applicable"}]'
+                $self = if ($Partial) { 'skipped (-Only)' } else { 'pass' }
+                Set-Content -LiteralPath (Join-Path $run 'summary.json') -Value (@{
+                        partial = [bool]$Partial; only = @(if ($Partial) { 'Kid' }); env = @{}
+                        rows = @(@{ Name = 'Kid'; Result = 'no build script'; Verify = 'not applicable' }, @{ Name = 'Claude.Framework'; Result = $self; Verify = 'not applicable' })
+                    } | ConvertTo-Json -Depth 4)
             }
             $run
         }
@@ -268,8 +273,6 @@ getters:
         $hbFramework = Join-Path $RunRoot 'hb-framework'
         $gradedHead = New-CommittedFolder $hbFramework @{ 'README.md' = 'fixture framework'; '.gitignore' = '.framework/' }
         $reused = New-FakeTestRun $hbFramework '20260101-000000-001'
-        # Newer, but no summary.json (a standalone tests/ run leaves such folders); -SkipUp must pass over it.
-        $null = New-FakeTestRun $hbFramework '20260101-000000-002' -NoSummary
 
         $first = Invoke-FrameworkHeartbeat -Manifest $hbManifest -ReposRoot $hbRepos -FrameworkRoot $hbFramework -SkipUp
         $second = Invoke-FrameworkHeartbeat -Manifest $hbManifest -ReposRoot $hbRepos -FrameworkRoot $hbFramework -SkipUp
@@ -324,16 +327,50 @@ getters:
         Should -Invoke -ModuleName Framework.Build Invoke-ChildProcess -Times 0 -Exactly
     }
 
-    It '-SkipUp reuses the newest test run that has a summary, and the record says reused' {
+    It '-SkipUp reuses the newest test run when it is whole, and the record says reused, not partial' {
         $first.TestRun.folder | Should -Be '20260101-000000-001'
         $first.TestRun.reused | Should -BeTrue
+        $first.Partial | Should -BeFalse
         $rec = Get-Content (Join-Path $first.Folder 'heartbeat.json') -Raw | ConvertFrom-Json
         $rec.test_run.reused | Should -BeTrue
         $rec.test_run.reason | Should -Be '-SkipUp'
         $rec.test_run.folder | Should -Be '20260101-000000-001'
+        $rec.reused_run | Should -Be '20260101-000000-001'
+        $rec.partial | Should -BeFalse
+        @($rec.untested).Count | Should -Be 0
+        $rec.PSObject.Properties.Name | Should -Contain 'env'
         $rec.framework.commit | Should -Be $gradedHead
         $rec.children[0].name | Should -Be 'Kid'
-        @(Get-ChildItem (Join-Path $hbFramework '.framework' 'test-runs') -Directory).Count | Should -Be 2
+        @(Get-ChildItem (Join-Path $hbFramework '.framework' 'test-runs') -Directory).Count | Should -Be 1
+    }
+
+    It '-SkipUp refuses a partial newest run, naming it, and leaves no heartbeat folder' {
+        $root = Join-Path $RunRoot 'hb-partial'
+        $null = New-FakeTestRun $root '20260101-000000-001'
+        $null = New-FakeTestRun $root '20260101-000000-002' -Partial
+        { Invoke-FrameworkHeartbeat -Manifest $hbManifest -ReposRoot $hbRepos -FrameworkRoot $root -SkipUp -Only Later } |
+            Should -Throw '*20260101-000000-002*is partial*Invoke-Build Test, then Heartbeat -SkipUp*-AllowPartial*'
+        Join-Path $root '.framework' 'heartbeats' | Should -Not -Exist
+    }
+
+    It '-SkipUp refuses a newest run with no summary.json, even when an older one has one' {
+        $root = Join-Path $RunRoot 'hb-nosummary'
+        $null = New-FakeTestRun $root '20260101-000000-001'
+        $null = New-FakeTestRun $root '20260101-000000-002' -NoSummary
+        { Invoke-FrameworkHeartbeat -Manifest $hbManifest -ReposRoot $hbRepos -FrameworkRoot $root -SkipUp -Only Later } |
+            Should -Throw '*20260101-000000-002*has no summary.json*-AllowPartial*'
+    }
+
+    It '-SkipUp -AllowPartial reuses the partial run and stamps partial and untested' {
+        $root = Join-Path $RunRoot 'hb-partial'
+        $r = Invoke-FrameworkHeartbeat -Manifest $hbManifest -ReposRoot $hbRepos -FrameworkRoot $root -SkipUp -AllowPartial -Only Later
+        $r.TestRun.folder | Should -Be '20260101-000000-002'
+        $r.Partial | Should -BeTrue
+        $r.Untested | Should -Be @('Claude.Framework')
+        $rec = Get-Content (Join-Path $r.Folder 'heartbeat.json') -Raw | ConvertFrom-Json
+        $rec.partial | Should -BeTrue
+        @($rec.untested) | Should -Be @('Claude.Framework')
+        $rec.reused_run | Should -Be '20260101-000000-002'
     }
 
     It 'Diff runs last against the previous heartbeat folder' {
@@ -414,7 +451,10 @@ task Test {
         $root = Join-Path $RunRoot 'framework-root-verify-skip'
         $file = Get-NewestRecord $root
         $before = [regex]::Match((Get-Content -LiteralPath $file -Raw), '"tested_at":\s*"[^"]+"').Value
-        $hb = Invoke-FrameworkHeartbeat -Manifest $vManifest -ReposRoot $vRepos -FrameworkRoot $root -SkipUp
+        # The run reused was made with -Only, so it is partial and -SkipUp needs -AllowPartial to take it.
+        $hb = Invoke-FrameworkHeartbeat -Manifest $vManifest -ReposRoot $vRepos -FrameworkRoot $root -SkipUp -AllowPartial
+        $hb.Partial | Should -BeTrue
+        $hb.Untested | Should -Be @('Claude.Framework')
         $hb.VerifyRows[0].Verify | Should -Be 'reproduces'
         $hb.Failures | Should -BeNullOrEmpty
         Join-Path $hb.Folder 'verify' 'Verified.verify-One.json' | Should -Exist
@@ -425,6 +465,30 @@ task Test {
         $rec.verify_outcome | Should -Be 'reproduces'
         $rec.verify_by | Should -Be "heartbeat $($hb.Stamp)"
         (Get-Content (Join-Path $hb.Folder 'heartbeat.json') -Raw | ConvertFrom-Json).children[0].verify | Should -Be 'ran'
+    }
+
+    It 'Verify writes a result.json with task: none when the reused run has none for the child' {
+        $root = Join-Path $RunRoot 'framework-root-verify-none'
+        $run = Join-Path $root '.framework' 'test-runs' '20260101-000000-001'
+        $null = New-Item -ItemType Directory -Path $run -Force
+        Set-Content -LiteralPath (Join-Path $run 'summary.json') -Value (@{
+                partial = $true; only = @('Claude.Framework'); env = @{}
+                rows = @(@{ Name = 'Verified'; Result = 'skipped (-Only)'; Verify = 'not run' }, @{ Name = 'Claude.Framework'; Result = 'pass'; Verify = 'not applicable' })
+            } | ConvertTo-Json -Depth 4)
+        $hb = Invoke-FrameworkHeartbeat -Manifest $vManifest -ReposRoot $vRepos -FrameworkRoot $root -SkipUp -AllowPartial
+        $hb.Untested | Should -Be @('Verified')
+        $file = Join-Path $run 'Verified.result.json'
+        $file | Should -Exist
+        $rec = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
+        $rec.task | Should -Be 'none'
+        $rec.verify | Should -Be 'ran'
+        $rec.verify_outcome | Should -Be 'reproduces'
+        $rec.verify_by | Should -Be "heartbeat $($hb.Stamp)"
+        $rec.commit | Should -Be (Get-Head $vChild)
+        $rec.partial | Should -BeTrue
+        $hb.VerifyRows[0].Note | Should -Match 'wrote one with task: none'
+        # Status does not take a verify-only record as the tested commit.
+        (Get-FrameworkStatus -Manifest $vManifest -ReposRoot $vRepos -RunsRoot (Join-Path $root '.framework' 'test-runs'))[0].TestedAt | Should -Be '-'
     }
 }
 
@@ -657,7 +721,8 @@ task Test {
         $yaml = Join-Path $RunRoot 'fixture-only.yaml'
         $entries = foreach ($n in 'Portal', 'Other') { "  - name: $n`n    url: https://example.invalid/$n.git`n    default_branch: main`n    build_script: true`n    result_file: preference" }
         $entries += "  - name: Plain`n    url: https://example.invalid/Plain.git`n    default_branch: main`n    build_script: false"
-        Set-Content -LiteralPath $yaml -Value ("requirements:`n  pester: '$pester'`nchildren:`n" + ($entries -join "`n"))
+        $envBlock = "env:`n  - name: FRAMEWORK_FIXTURE_LEDGER`n    value: '{repos_root}\ledger.jsonl'`n    wanted: file exists`n"
+        Set-Content -LiteralPath $yaml -Value ("requirements:`n  pester: '$pester'`n" + $envBlock + "children:`n" + ($entries -join "`n"))
         $manifest = Get-FrameworkManifest $yaml
 
         $root = Join-Path $RunRoot 'framework-root-only'
@@ -702,6 +767,29 @@ task Test {
         $rec.actual.passed, $rec.actual.failed, $rec.actual.skipped | Should -Be @(1, 0, 0)
         $rec.verify | Should -Be 'not applicable'
         $by['Portal'].Commit | Should -Be $head.Substring(0, 7)
+    }
+
+    It 'result.json and summary.json carry env and partial; a -Only run is partial' {
+        $ledger = Join-Path $childRepos 'ledger.jsonl'
+        $rec = Get-Content -LiteralPath (Join-Path $run 'Portal.result.json') -Raw | ConvertFrom-Json
+        $rec.env.FRAMEWORK_FIXTURE_LEDGER | Should -Be $ledger
+        $rec.partial | Should -BeTrue
+        $sum = Get-Content -LiteralPath (Join-Path $run 'summary.json') -Raw | ConvertFrom-Json
+        $sum.partial | Should -BeTrue
+        $sum.only | Should -Be @('Portal')
+        $sum.env.FRAMEWORK_FIXTURE_LEDGER | Should -Be $ledger
+        $sum.rows.Name | Should -Be @('Portal', 'Other', 'Plain', 'Claude.Framework')
+        $env:FRAMEWORK_FIXTURE_LEDGER | Should -Be $ledger
+    }
+
+    It 'a run without -Only is not partial' {
+        # Every child task is mocked, so Claude.Framework's SelfTest does not run this suite again.
+        Mock -ModuleName Framework.Build Invoke-ChildTask { 0 }
+        $wholeRoot = Join-Path $RunRoot 'framework-root-whole'
+        $null = Invoke-FrameworkTest -Manifest $manifest -ReposRoot $childRepos -FrameworkRoot $wholeRoot
+        $wholeRun = @(Get-ChildItem (Join-Path $wholeRoot '.framework' 'test-runs') -Directory)[0].FullName
+        (Get-Content -LiteralPath (Join-Path $wholeRun 'summary.json') -Raw | ConvertFrom-Json).partial | Should -BeFalse
+        (Get-Content -LiteralPath (Join-Path $wholeRun 'Portal.result.json') -Raw | ConvertFrom-Json).partial | Should -BeFalse
     }
 
     It 'a dirty child is recorded dirty and its Commit ends in *' {
@@ -749,35 +837,68 @@ Describe 'Test -Full plans full_test_task where declared' {
     }
 }
 
-Describe 'Requirements: CLAUDE_CHAIN_LEDGER and Invoke-Build' {
+Describe 'Requirements: env entries and Invoke-Build' {
     BeforeAll {
         $manifest = Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')
         $savedLedger = $env:CLAUDE_CHAIN_LEDGER
-        function Get-Row { param([string]$Name) Test-FrameworkRequirements -Manifest $manifest | Where-Object Requirement -eq $Name }
+        $savedUser = [Environment]::GetEnvironmentVariable('CLAUDE_CHAIN_LEDGER', 'User')
+        # A fixture repos root holding Claude.Chain's ledger where the real manifest's env entry derives it.
+        $reqRepos = Join-Path $RunRoot 'req-repos'
+        $derived = Join-Path $reqRepos 'Claude.Chain' 'ledger' 'chain.jsonl'
+        $null = New-Item -ItemType Directory -Path (Split-Path $derived) -Force
+        Set-Content -LiteralPath $derived -Value '{}'
+        function Get-Row {
+            param([string]$Name, [string]$Repos = $reqRepos)
+            Test-FrameworkRequirements -Manifest $manifest -FrameworkRoot $RunRoot -ReposRoot $Repos | Where-Object Requirement -eq $Name
+        }
     }
     AfterAll { $env:CLAUDE_CHAIN_LEDGER = $savedLedger }
 
-    It 'CLAUDE_CHAIN_LEDGER unset: Found (unset), Ok false' {
+    It 'framework.yaml derives CLAUDE_CHAIN_LEDGER from repos_root' {
+        $e = @($manifest.Env)
+        $e.Count | Should -Be 1
+        $e[0].Name | Should -Be 'CLAUDE_CHAIN_LEDGER'
+        $e[0].Value | Should -Be '{repos_root}\Claude.Chain\ledger\chain.jsonl'
+        $e[0].Wanted | Should -Be 'file exists'
+    }
+
+    It 'shell unset: sets the derived path in this process, Ok true, Note "shell unset"' {
         $env:CLAUDE_CHAIN_LEDGER = $null
         $r = Get-Row 'CLAUDE_CHAIN_LEDGER'
         $r.Wanted | Should -Be 'file exists'
-        $r.Found | Should -Be '(unset)'
-        $r.Ok | Should -BeFalse
+        $r.Found | Should -Be $derived
+        $r.Ok | Should -BeTrue
+        $r.Note | Should -Be 'shell unset'
+        $env:CLAUDE_CHAIN_LEDGER | Should -Be $derived
     }
 
-    It 'CLAUDE_CHAIN_LEDGER pointing at a missing path: Found shows it, Ok false' {
-        $missing = Join-Path $RunRoot 'no-such-ledger.jsonl'
-        $env:CLAUDE_CHAIN_LEDGER = $missing
+    It 'shell wrong: Ok true, Note "shell had ...", and the derived path replaces it' {
+        $dead = Join-Path $RunRoot 'dead' 'chain.jsonl'
+        $env:CLAUDE_CHAIN_LEDGER = $dead
         $r = Get-Row 'CLAUDE_CHAIN_LEDGER'
-        $r.Found | Should -Be $missing
+        $r.Ok | Should -BeTrue
+        $r.Note | Should -Be "shell had $dead"
+        $env:CLAUDE_CHAIN_LEDGER | Should -Be $derived
+    }
+
+    It 'shell equal: Note blank' {
+        $env:CLAUDE_CHAIN_LEDGER = $derived
+        (Get-Row 'CLAUDE_CHAIN_LEDGER').Note | Should -Be ''
+    }
+
+    It 'derived file missing: Ok false' {
+        $r = Get-Row 'CLAUDE_CHAIN_LEDGER' -Repos (Join-Path $RunRoot 'no-such-repos')
+        $r.Found | Should -Be (Join-Path $RunRoot 'no-such-repos' 'Claude.Chain' 'ledger' 'chain.jsonl')
         $r.Ok | Should -BeFalse
     }
 
-    It 'CLAUDE_CHAIN_LEDGER pointing at a file: Ok true' {
-        $file = Join-Path $RunRoot 'ledger.jsonl'
-        Set-Content -LiteralPath $file -Value '{}'
-        $env:CLAUDE_CHAIN_LEDGER = $file
-        (Get-Row 'CLAUDE_CHAIN_LEDGER').Ok | Should -BeTrue
+    It 'writes nothing to User scope' {
+        $null = Get-Row 'CLAUDE_CHAIN_LEDGER'
+        [Environment]::GetEnvironmentVariable('CLAUDE_CHAIN_LEDGER', 'User') | Should -Be $savedUser
+    }
+
+    It 'every row has a Note column' {
+        Test-FrameworkRequirements -Manifest $manifest -FrameworkRoot $RunRoot -ReposRoot $reqRepos | ForEach-Object { $_.PSObject.Properties.Name | Should -Contain 'Note' }
     }
 
     It 'Invoke-Build is importable in this process' {
@@ -791,12 +912,13 @@ Describe 'Requirements: CLAUDE_CHAIN_LEDGER and Invoke-Build' {
 Describe 'the Ontology rename' {
     It 'no file outside repos\ contains the old workspace header' {
         # Built in two parts so this file does not match itself. .framework/test-runs is skipped: it holds child
-        # output, and Claude.Ontology's own tests name the old header as the foreign one.
+        # output, and Claude.Ontology's own tests name the old header as the foreign one. .framework/fixtures holds
+        # this suite's scratch repos.
         $needle = 'WORKSPACE: ' + 'plugins'
-        $runsDir = Join-Path $FrameworkRoot '.framework' 'test-runs'
+        $skip = @((Join-Path $FrameworkRoot '.framework' 'test-runs'), (Join-Path $FrameworkRoot '.framework' 'fixtures'))
         $files = Get-ChildItem -LiteralPath $FrameworkRoot -Force | Where-Object Name -notin 'repos', '.git' | ForEach-Object {
             if ($_.PSIsContainer) { Get-ChildItem -LiteralPath $_.FullName -Recurse -File -Force } else { $_ }
-        } | Where-Object { -not $_.FullName.StartsWith($runsDir, [StringComparison]::OrdinalIgnoreCase) }
+        } | Where-Object { $f = $_.FullName; -not ($skip | Where-Object { $f.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }) }
         $files | Should -Not -BeNullOrEmpty
         $hits = @($files | Select-String -SimpleMatch -Pattern $needle -List | ForEach-Object Path)
         $hits | Should -BeNullOrEmpty
@@ -864,10 +986,38 @@ Describe 'Bootstrap gate' {
         Join-Path $state 'bootstrap.done' | Should -Not -Exist
     }
 
-    It 'the real placeholder records that it ran' {
+    It 'the real script records that it ran' {
         $state = Join-Path $RunRoot 'bootstrap-real'
         Invoke-FrameworkBootstrap -StateRoot $state -Script (Join-Path $FrameworkRoot 'build' 'Bootstrap.ps1') | Out-Null
-        Get-Content -LiteralPath (Join-Path $state 'bootstrap.log') | Should -Match 'bootstrap placeholder ran'
+        Get-Content -LiteralPath (Join-Path $state 'bootstrap.log') | Should -Match 'bootstrap ran; 0 env var'
+    }
+}
+
+Describe 'Bootstrap persists env entries to User scope' {
+    BeforeAll {
+        # A fixture variable, never the real CLAUDE_CHAIN_LEDGER; removed from User scope after.
+        $name = 'FRAMEWORK_FIXTURE_BOOTSTRAP_ENV'
+        $script = Join-Path $FrameworkRoot 'build' 'Bootstrap.ps1'
+        $state = Join-Path $RunRoot 'bootstrap-env'
+        $user = { [Environment]::GetEnvironmentVariable($name, 'User') }
+    }
+    AfterAll { [Environment]::SetEnvironmentVariable($name, $null, 'User') }
+
+    It 'writes the value to User scope, honours the done marker, and writes again with -Force' {
+        & $user | Should -BeNullOrEmpty
+        $r = Invoke-FrameworkBootstrap -StateRoot $state -Script $script -Environment ([ordered]@{ $name = 'first' })
+        $r.Action | Should -Be 'ran'
+        & $user | Should -Be 'first'
+        $r.Lines | Should -Contain "wrote User $name=first"
+
+        $r = Invoke-FrameworkBootstrap -StateRoot $state -Script $script -Environment ([ordered]@{ $name = 'second' })
+        $r.Action | Should -Be 'skipped'
+        & $user | Should -Be 'first'
+
+        $r = Invoke-FrameworkBootstrap -StateRoot $state -Script $script -Environment ([ordered]@{ $name = 'second' }) -Force
+        $r.Action | Should -Be 'ran (-Force)'
+        & $user | Should -Be 'second'
+        [Environment]::GetEnvironmentVariable($name, 'Machine') | Should -BeNullOrEmpty
     }
 }
 
@@ -889,6 +1039,55 @@ Describe 'test-runs retention' {
 
     It 'refuses to keep fewer than one' {
         { New-FrameworkRunFolder -Root (Join-Path $RunRoot 'retention0') -Keep 0 } | Should -Throw
+    }
+
+    It 'keeps the test run the newest heartbeat reused, past -KeepRuns' {
+        $state = Join-Path $RunRoot 'retention-protect'
+        $runs = Join-Path $state 'test-runs'
+        foreach ($i in 1..7) {
+            $d = Join-Path $runs "20200101-000000-00$i"
+            $null = New-Item -ItemType Directory -Path $d -Force
+            Set-Content -LiteralPath (Join-Path $d 'summary.json') -Value '{}'
+        }
+        # An older heartbeat cites -002; the newest kept one cites -001, and only that one counts.
+        foreach ($h in @(@('20200101-000000-001', '20200101-000000-002'), @('20200101-000000-002', '20200101-000000-001'))) {
+            $hb = Join-Path $state 'heartbeats' $h[0]
+            $null = New-Item -ItemType Directory -Path $hb -Force
+            Set-Content -LiteralPath (Join-Path $hb 'heartbeat.json') -Value (@{ reused_run = $h[1]; test_run = @{ folder = $h[1]; reused = $true } } | ConvertTo-Json)
+        }
+        Get-HeartbeatReusedRun (Join-Path $state 'heartbeats') | Should -Be '20200101-000000-001'
+
+        $r = InModuleScope Framework.Build -Parameters @{ S = $state } { param($S) New-FrameworkTestRunFolder -StateRoot $S -Keep 5 }
+        $left = @(Get-ChildItem -LiteralPath $runs -Directory).Name
+        $left | Should -Contain '20200101-000000-001'
+        $left | Should -Not -Contain '20200101-000000-002'
+        $left | Should -Not -Contain '20200101-000000-003'
+        $left | Should -Contain (Split-Path $r.Path -Leaf)
+        Join-Path $state 'prune.log' | Should -Not -Exist
+    }
+
+    It 'reads the reused run from a heartbeat.json written before reused_run existed' {
+        $hbRoot = Join-Path $RunRoot 'retention-legacy' 'heartbeats'
+        $hb = Join-Path $hbRoot '20200101-000000-001'
+        $null = New-Item -ItemType Directory -Path $hb -Force
+        Set-Content -LiteralPath (Join-Path $hb 'heartbeat.json') -Value '{"test_run":{"folder":"20190101-000000-001","reused":true,"reason":"-SkipUp"}}'
+        Get-HeartbeatReusedRun $hbRoot | Should -Be '20190101-000000-001'
+    }
+
+    It 'logs a summary-less folder to prune.log before pruning it' {
+        $state = Join-Path $RunRoot 'retention-log'
+        $runs = Join-Path $state 'test-runs'
+        foreach ($i in 1..6) {
+            $d = Join-Path $runs "20200101-000000-00$i"
+            $null = New-Item -ItemType Directory -Path $d -Force
+            if ($i -ne 1) { Set-Content -LiteralPath (Join-Path $d 'summary.json') -Value '{}' }
+        }
+        $r = InModuleScope Framework.Build -Parameters @{ S = $state } { param($S) New-FrameworkTestRunFolder -StateRoot $S -Keep 4 }
+        $r.Pruned | Sort-Object | Should -Be @('20200101-000000-001', '20200101-000000-002', '20200101-000000-003')
+        $log = @(Get-Content -LiteralPath (Join-Path $state 'prune.log'))
+        $log.Count | Should -Be 1
+        $log[0] | Should -Match ([regex]::Escape((Join-Path $runs '20200101-000000-001')) + ': no summary\.json')
+        Join-Path $runs '20200101-000000-001' | Should -Not -Exist
     }
 }
 

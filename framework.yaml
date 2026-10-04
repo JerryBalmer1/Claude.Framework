@@ -17,6 +17,15 @@ requirements:
   pester: '6.2.0'          # Claude.Skills needs >=6.2.0; Chain and Portal need >=5.5.0
   powershell_yaml: '0.4.12' # parses this file
 
+# Environment variables the build derives itself. Requirements, Test and Heartbeat set each in their own process, so
+# every child pwsh, Verify and getter inherits the derived value, not a stale shell's; a differing shell value is
+# noted, not failed. Bootstrap persists each to User scope. value takes {framework_root} and {repos_root}, as getters do.
+# Required: name, value, wanted (file exists).
+env:
+  - name: CLAUDE_CHAIN_LEDGER
+    value: '{repos_root}\Claude.Chain\ledger\chain.jsonl'
+    wanted: file exists
+
 children:
   - name: Claude.Root
     url: https://github.com/JerryBalmer1/Claude.Root.git

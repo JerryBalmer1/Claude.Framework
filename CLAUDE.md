@@ -8,6 +8,7 @@ Claude.Framework is the controller and docs home for the seven child repos. Chil
 - Never commit, push, tag, rename a folder or delete anything. Jerry does those.
 - One exception to the delete rule: the build prunes `.framework/test-runs/`. Each Test run, and each standalone run of `tests/`, keeps the newest 5 run folders (`-KeepRuns`) and removes older ones. It touches only folders named like a run stamp (`yyyyMMdd-HHmmss-fff`). Running the build may do this; agents do not delete there by hand.
 - The same exception covers `.framework/heartbeats/`. Each Heartbeat run keeps the newest 5 heartbeat folders (`-KeepRuns`) and removes older ones, touching only folders named like a run stamp. Running the build may do this; agents do not delete there by hand.
+- Bootstrap (`build/Bootstrap.ps1`) writes each `env:` entry in `framework.yaml` to User scope. This is the only place the build writes outside the repo.
 
 ## Where agents may read
 
