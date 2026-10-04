@@ -1,5 +1,10 @@
 # Manifest of the child repos. Sync clones each into repos/<name>.
 # Claude.Ontology is the renamed Claude.Ontology.Plugins. Claude.Ontology.Old is the archive and is not listed.
+# Optional per child:
+#   expect.tasks_before_test  tasks the Test task runs first, each in its own child process
+#   expect.expected_failures  known failing tests; up to this many is pass-with-known, more is FAIL (needs reason)
+#   expect.no_tests           true when the child has no *.Tests.ps1 files; reported as no-tests (needs reason)
+#   verify                    a script under the child, run once per plugin after Test
 
 requirements:
   powershell: '7.4'
@@ -31,13 +36,24 @@ children:
     url: https://github.com/JerryBalmer1/Claude.Skills.git
     default_branch: develop
     build_script: true
+    expect:
+      no_tests: true
+      reason: no test files on develop
 
   - name: Claude.Ontology
     url: https://github.com/JerryBalmer1/Claude.Ontology.git
     default_branch: main
     build_script: true
+    expect:
+      expected_failures: 16
+      reason: contract tests need built graphs
+    verify:
+      script: forge/tools/Invoke-PluginVerify.ps1
+      plugins: [Synthetic, Prowler, Microsoft.AzureDevOps]
 
   - name: Claude.Portal
     url: https://github.com/JerryBalmer1/Claude.Portal.git
     default_branch: main
     build_script: true
+    expect:
+      tasks_before_test: [Install]

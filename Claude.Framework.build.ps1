@@ -5,14 +5,22 @@
 
 .DESCRIPTION
     Requirements  checks git, PowerShell, Pester, powershell-yaml, Docker and Docker Compose; fails if any is missing.
+    Bootstrap     runs build/Bootstrap.ps1 once; skipped while .framework/bootstrap.done exists, re-run with -Force.
     Sync          clones or fast-forwards every child in framework.yaml into repos/.
     Status        prints branch, ahead/behind, dirty count, last commit and build script per child.
-    Test          runs each child's own Invoke-Build Test, then SelfTest; prints one table.
+    Test          runs each child's own Test in a fresh pwsh in its folder (tasks_before_test first, verify after),
+                  then SelfTest the same way; prints actual against the expect block in framework.yaml.
+                  Results go to .framework/test-runs/<stamp>/; the latest -KeepRuns run folders are kept.
     SelfTest      runs Framework's own Pester suite under tests/.
+    Up            Requirements, Bootstrap, Sync, Test, Status; stops at the first failing task.
 #>
 param(
     # Limit Test to these child names (and/or Claude.Framework).
-    [string[]]$Only
+    [string[]]$Only,
+    # Run Bootstrap even when its marker exists.
+    [switch]$Force,
+    # How many run folders .framework/test-runs/ keeps.
+    [int]$KeepRuns = 5
 )
 
 Set-StrictMode -Version Latest
@@ -28,6 +36,11 @@ task Requirements {
     if ($missing) { throw "Missing requirements: $($missing.Requirement -join ', ')" }
 }
 
+task Bootstrap {
+    $r = Invoke-FrameworkBootstrap -StateRoot (Join-Path $BuildRoot '.framework') -Script (Join-Path $BuildRoot 'build' 'Bootstrap.ps1') -Force:$Force
+    print Cyan "Bootstrap $($r.Action): $($r.Detail)"
+}
+
 task Sync {
     $rows = @(Sync-Framework -Manifest (Get-FrameworkManifest $ManifestPath) -ReposRoot $ReposRoot)
     $rows | Format-Table -AutoSize -Wrap | Out-String -Width 200
@@ -41,10 +54,10 @@ task Status {
 }
 
 task Test {
-    $rows = @(Invoke-FrameworkTest -Manifest (Get-FrameworkManifest $ManifestPath) -ReposRoot $ReposRoot -FrameworkRoot $BuildRoot -Only $Only)
-    $rows | Select-Object Name, Result, Passed, Failed, Skipped, Seconds | Format-Table -AutoSize | Out-String -Width 200
-    $failed = @($rows | Where-Object Result -eq 'FAIL')
-    if ($failed) { throw "Test failed for: $($failed.Name -join ', '). Logs: .framework/test-results/" }
+    $rows = @(Invoke-FrameworkTest -Manifest (Get-FrameworkManifest $ManifestPath) -ReposRoot $ReposRoot -FrameworkRoot $BuildRoot -Only $Only -KeepRuns $KeepRuns)
+    $rows | Format-Table Name, Result, Expected, Passed, Failed, Skipped, Verify, Seconds, Note -AutoSize -Wrap | Out-String -Width 250
+    $failed = @($rows | Where-Object { $_.Result -eq 'FAIL' -or $_.Verify -eq 'does not' })
+    if ($failed) { throw "Test failed for: $($failed.Name -join ', '). Logs: .framework/test-runs/" }
 }
 
 task SelfTest {
@@ -58,5 +71,7 @@ task SelfTest {
         throw "Pester: $($result.FailedCount) failed, result '$($result.Result)'."
     }
 }
+
+task Up Requirements, Bootstrap, Sync, Test, Status
 
 task . Requirements, Status

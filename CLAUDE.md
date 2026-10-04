@@ -6,6 +6,7 @@ Claude.Framework is the controller and docs home for the seven child repos. Chil
 
 - Edit files, stage them, then stop and report what changed.
 - Never commit, push, tag, rename a folder or delete anything. Jerry does those.
+- One exception to the delete rule: the build prunes `.framework/test-runs/`. Each Test run, and each standalone run of `tests/`, keeps the newest 5 run folders (`-KeepRuns`) and removes older ones. It touches only folders named like a run stamp (`yyyyMMdd-HHmmss-fff`). Running the build may do this; agents do not delete there by hand.
 
 ## Where agents may read
 

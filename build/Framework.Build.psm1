@@ -27,6 +27,40 @@ function Invoke-Git {
     return $text
 }
 
+function ConvertTo-ChildExpectation {
+    # The optional per-child expect block: tasks run before Test, a count of known failures, or no test files.
+    # A known failure count or no_tests needs a one-line reason.
+    param([string]$Name, $Block)
+    $e = [pscustomobject]@{ TasksBeforeTest = @(); ExpectedFailures = 0; NoTests = $false; Reason = $null }
+    if ($null -eq $Block) { return $e }
+    if ($Block -isnot [System.Collections.IDictionary]) { throw "Manifest entry '$Name': expect must be a mapping." }
+    $unknown = @($Block.Keys | Where-Object { $_ -notin 'tasks_before_test', 'expected_failures', 'no_tests', 'reason' })
+    if ($unknown) { throw "Manifest entry '$Name': unknown expect key(s) $($unknown -join ', ')." }
+    if ($Block.Contains('tasks_before_test')) { $e.TasksBeforeTest = @($Block.tasks_before_test | ForEach-Object { [string]$_ }) }
+    if ($Block.Contains('expected_failures')) {
+        $n = $Block.expected_failures
+        if (($n -isnot [int] -and $n -isnot [long]) -or $n -lt 0) { throw "Manifest entry '$Name': expected_failures must be a whole number >= 0." }
+        $e.ExpectedFailures = [int]$n
+    }
+    if ($Block.Contains('no_tests')) {
+        if ($Block.no_tests -isnot [bool]) { throw "Manifest entry '$Name': no_tests must be true or false." }
+        $e.NoTests = $Block.no_tests
+    }
+    if ($Block.Contains('reason')) { $e.Reason = [string]$Block.reason }
+    if (($e.ExpectedFailures -gt 0 -or $e.NoTests) -and -not $e.Reason) {
+        throw "Manifest entry '$Name': expected_failures and no_tests need a reason."
+    }
+    $e
+}
+
+function ConvertTo-ChildVerify {
+    # The optional per-child verify block: a script under the child, run once per plugin after Test.
+    param([string]$Name, $Block)
+    if ($null -eq $Block) { return $null }
+    if (-not $Block.Contains('script') -or -not $Block.Contains('plugins')) { throw "Manifest entry '$Name': verify needs script and plugins." }
+    [pscustomobject]@{ Script = [string]$Block.script; Plugins = @($Block.plugins | ForEach-Object { [string]$_ }) }
+}
+
 function Get-FrameworkManifest {
     param([Parameter(Mandatory)][string]$Path)
     Import-Module powershell-yaml -ErrorAction Stop
@@ -45,6 +79,8 @@ function Get-FrameworkManifest {
             Url           = [string]$c.url
             DefaultBranch = [string]$c.default_branch
             BuildScript   = [bool]$c.build_script
+            Expect        = ConvertTo-ChildExpectation -Name $c.name -Block $c['expect']
+            Verify        = ConvertTo-ChildVerify -Name $c.name -Block $c['verify']
         }
     }
     $dupes = $children | Group-Object Name | Where-Object Count -gt 1
@@ -222,7 +258,7 @@ function Get-FrameworkStatus {
 
 function Read-JUnitCounts {
     param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $null }
     [xml]$x = Get-Content -LiteralPath $Path -Raw
     [pscustomobject]@{
         Total   = $x.SelectNodes('//testcase').Count
@@ -231,74 +267,240 @@ function Read-JUnitCounts {
     }
 }
 
-function Invoke-ChildTest {
-    # Runs one Invoke-Build Test in a fresh pwsh so module versions and strict mode cannot leak between
-    # children. $PesterPreference adds a JUnit result file without touching the child's own config.
+function Invoke-ChildProcess {
+    # Runs $Script in a fresh pwsh whose working directory is $WorkingDirectory. Nothing from this session reaches
+    # it but the script text, its arguments and the inherited environment. All output goes to $LogFile (absolute).
+    # Returns the exit code.
     param(
-        [Parameter(Mandatory)][string]$Name,
-        [Parameter(Mandatory)][string]$BuildFile,
-        [Parameter(Mandatory)][string]$ResultFile,
+        [Parameter(Mandatory)][string]$WorkingDirectory,
+        [Parameter(Mandatory)][string]$Script,
+        [object[]]$ArgumentList = @(),
         [Parameter(Mandatory)][string]$LogFile,
-        [string]$Task = 'Test'
+        [hashtable]$Environment = @{}
     )
-    if (Test-Path -LiteralPath $ResultFile) { Move-Item -LiteralPath $ResultFile -Destination "$ResultFile.$(Get-Date -Format yyyyMMddHHmmss).old" }
-    $script = @'
-param($BuildFile, $ResultFile, $Task, $PesterVersion)
-Import-Module Pester -RequiredVersion $PesterVersion -ErrorAction Stop
-$global:PesterPreference = New-PesterConfiguration
-$global:PesterPreference.TestResult.Enabled = $true
-$global:PesterPreference.TestResult.OutputFormat = 'JUnitXml'
-$global:PesterPreference.TestResult.OutputPath = $ResultFile
-Invoke-Build $Task -File $BuildFile
-'@
-    $quote = { "'" + ($args[0] -replace "'", "''") + "'" }
-    $call = "& {{ {0} }} {1} {2} {3} {4}" -f $script, (& $quote $BuildFile), (& $quote $ResultFile), (& $quote $Task), (& $quote $script:PesterVersion)
+    $quote = { "'" + ("$($args[0])" -replace "'", "''") + "'" }
+    $call = '& {{ {0} }} {1}' -f $Script, (@($ArgumentList | ForEach-Object { & $quote $_ }) -join ' ')
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($call))
-    $sw = [Diagnostics.Stopwatch]::StartNew()
-    & pwsh -NoProfile -NonInteractive -EncodedCommand $encoded *> $LogFile
-    $exit = $LASTEXITCODE
-    $sw.Stop()
-    $counts = Read-JUnitCounts $ResultFile
-    [pscustomobject]@{
-        Name     = $Name
-        Result   = if ($exit -eq 0) { 'pass' } else { 'FAIL' }
-        Passed   = if ($counts) { $counts.Total - $counts.Failed - $counts.Skipped } else { $null }
-        Failed   = if ($counts) { $counts.Failed } else { $null }
-        Skipped  = if ($counts) { $counts.Skipped } else { $null }
-        Seconds  = [math]::Round($sw.Elapsed.TotalSeconds, 1)
-        Log      = $LogFile
+    $saved = @{}
+    foreach ($k in $Environment.Keys) {
+        $saved[$k] = [Environment]::GetEnvironmentVariable($k)
+        [Environment]::SetEnvironmentVariable($k, $Environment[$k])
+    }
+    # A native command starts in the current FileSystem location.
+    Push-Location -LiteralPath $WorkingDirectory
+    try {
+        & pwsh -NoProfile -NonInteractive -EncodedCommand $encoded *> $LogFile
+        $LASTEXITCODE
+    }
+    finally {
+        Pop-Location
+        foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
     }
 }
 
-$script:PesterVersion = $null
+function Invoke-ChildTask {
+    # Runs `Invoke-Build <Task>` in a fresh pwsh in the child's own folder, where Invoke-Build finds the child's
+    # build script; the child's rules govern that process. Framework passes only the task name. With -ResultFile,
+    # a $PesterPreference in that process adds a JUnit file; the child's own Pester configuration is not touched.
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Task,
+        [Parameter(Mandatory)][string]$LogFile,
+        [string]$ResultFile = '',
+        [string]$PesterVersion = '',
+        [hashtable]$Environment = @{}
+    )
+    $script = @'
+param($Task, $ResultFile, $PesterVersion)
+if ($ResultFile) {
+    if ($PesterVersion) { Import-Module Pester -RequiredVersion $PesterVersion -ErrorAction Stop } else { Import-Module Pester -ErrorAction Stop }
+    $global:PesterPreference = New-PesterConfiguration
+    $global:PesterPreference.TestResult.Enabled = $true
+    $global:PesterPreference.TestResult.OutputFormat = 'JUnitXml'
+    $global:PesterPreference.TestResult.OutputPath = $ResultFile
+}
+Invoke-Build $Task
+'@
+    Invoke-ChildProcess -WorkingDirectory $Path -Script $script -ArgumentList $Task, $ResultFile, $PesterVersion -LogFile $LogFile -Environment $Environment
+}
+
+function Invoke-ChildVerify {
+    # Runs the child's verify script once per plugin, each in a fresh pwsh in the child's folder, and writes what
+    # it returns to <RunFolder>/<Name>.verify-<plugin>.json. Verify is 'reproduces' only if every plugin does.
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]$Verify,
+        [Parameter(Mandatory)][string]$RunFolder
+    )
+    $script = @'
+param($ScriptPath, $Plugin, $OutFile)
+$r = & (Join-Path $PWD $ScriptPath) -Plugin $Plugin
+$r | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $OutFile
+if (-not $r.Reproduces) { exit 1 }
+'@
+    $rows = foreach ($plugin in $Verify.Plugins) {
+        $out = Join-Path $RunFolder "$Name.verify-$plugin.json"
+        $exit = Invoke-ChildProcess -WorkingDirectory $Path -Script $script -ArgumentList $Verify.Script, $plugin, $out -LogFile (Join-Path $RunFolder "$Name.verify-$plugin.log")
+        $r = if (Test-Path -LiteralPath $out) { Get-Content -LiteralPath $out -Raw | ConvertFrom-Json }
+        [pscustomobject]@{ Plugin = $plugin; Reproduces = ($exit -eq 0 -and $r -and $r.Reproduces -eq $true) }
+    }
+    $no = @($rows | Where-Object { -not $_.Reproduces })
+    [pscustomobject]@{
+        Verify = if ($no) { 'does not' } else { 'reproduces' }
+        Note   = if ($no) { "does not reproduce: $($no.Plugin -join ', ')" } else { "reproduces: $($rows.Plugin -join ', ')" }
+    }
+}
+
+function Get-TestVerdict {
+    # Compares one child's Test run with its expectation. Result is pass, pass-with-known, no-tests or FAIL.
+    #   no_tests and no test files found      -> no-tests (Pester exits non-zero on an empty run; that is expected)
+    #   no JUnit counts                       -> FAIL
+    #   failed > expected_failures            -> FAIL
+    #   0 < failed <= expected_failures       -> pass-with-known
+    #   failed = 0 and the task exited 0      -> pass
+    #   failed = 0 and the task exited non-0  -> FAIL (something other than a test broke)
+    param(
+        [Parameter(Mandatory)][int]$ExitCode,
+        $Counts,
+        [Parameter(Mandatory)]$Expect,
+        [int]$TestFileCount = -1
+    )
+    $notes = [System.Collections.Generic.List[string]]::new()
+    if ($Expect.NoTests) {
+        if ($TestFileCount -eq 0 -or ($TestFileCount -lt 0 -and (-not $Counts -or $Counts.Total -eq 0))) {
+            return [pscustomobject]@{ Result = 'no-tests'; Note = "$($Expect.Reason) (Test exit $ExitCode)" }
+        }
+        $notes.Add("no_tests is stale: $TestFileCount test file(s) found")
+    }
+    if (-not $Counts) {
+        $notes.Add("no JUnit results; Test exit $ExitCode")
+        return [pscustomobject]@{ Result = 'FAIL'; Note = $notes -join '; ' }
+    }
+    $expected = $Expect.ExpectedFailures
+    $result = if ($Counts.Failed -gt $expected) {
+        $notes.Add("$($Counts.Failed) failed, $expected expected")
+        'FAIL'
+    }
+    elseif ($Counts.Failed -gt 0) {
+        if ($Counts.Failed -lt $expected) { $notes.Add("fewer failures than expected ($($Counts.Failed) < $expected)") }
+        $notes.Add($Expect.Reason)
+        'pass-with-known'
+    }
+    elseif ($ExitCode -ne 0) {
+        $notes.Add("no test failed but Test exit $ExitCode")
+        'FAIL'
+    }
+    else {
+        if ($expected -gt 0) { $notes.Add("expected $expected failures, none; lower expected_failures") }
+        'pass'
+    }
+    [pscustomobject]@{ Result = $result; Note = $notes -join '; ' }
+}
+
+function New-FrameworkRunFolder {
+    # Creates <Root>/<yyyyMMdd-HHmmss-fff> and removes the oldest run folders so that $Keep remain, the new one
+    # included. CLAUDE.md names this as the one place Framework deletes; only folders named like a stamp are touched.
+    param([Parameter(Mandatory)][string]$Root, [int]$Keep = 5)
+    if ($Keep -lt 1) { throw "Keep must be at least 1." }
+    if (-not (Test-Path -LiteralPath $Root)) { $null = New-Item -ItemType Directory -Path $Root -Force }
+    do {
+        $path = Join-Path $Root (Get-Date -Format 'yyyyMMdd-HHmmss-fff')
+    } while (Test-Path -LiteralPath $path)
+    $null = New-Item -ItemType Directory -Path $path
+    $old = @(Get-ChildItem -LiteralPath $Root -Directory | Where-Object Name -match '^\d{8}-\d{6}-\d{3}$' |
+            Sort-Object Name -Descending | Select-Object -Skip $Keep)
+    foreach ($d in $old) { Remove-Item -LiteralPath $d.FullName -Recurse -Force }
+    [pscustomobject]@{ Path = $path; Pruned = @($old | ForEach-Object Name) }
+}
 
 function Invoke-FrameworkTest {
+    # Runs every child that has a build script through its own Test in a fresh pwsh, then Framework's SelfTest.
+    # Results, logs and JUnit files go to .framework/test-runs/<stamp>/.
     param(
         [Parameter(Mandatory)]$Manifest,
         [Parameter(Mandatory)][string]$ReposRoot,
         [Parameter(Mandatory)][string]$FrameworkRoot,
-        [string[]]$Only
+        [string[]]$Only,
+        [int]$KeepRuns = 5
     )
-    $script:PesterVersion = $Manifest.Requirements.pester
-    $out = Join-Path $FrameworkRoot '.framework' 'test-results'
-    if (-not (Test-Path -LiteralPath $out)) { $null = New-Item -ItemType Directory -Path $out -Force }
-
-    foreach ($c in $Manifest.Children) {
-        if ($Only -and $c.Name -notin $Only) { continue }
-        $path = Join-Path $ReposRoot $c.Name
-        $bs = if (Test-Path -LiteralPath $path) { Find-ChildBuildScript $path }
-        if (-not $bs) {
-            [pscustomobject]@{ Name = $c.Name; Result = 'no build script'; Passed = $null; Failed = $null; Skipped = $null; Seconds = $null; Log = $null }
-            continue
+    $pester = [string]$Manifest.Requirements.pester
+    $run = (New-FrameworkRunFolder -Root (Join-Path $FrameworkRoot '.framework' 'test-runs') -Keep $KeepRuns).Path
+    $row = {
+        param($Name, $Result, $Expected, $Counts, $Verify, $Seconds, $Note)
+        [pscustomobject]@{
+            Name = $Name; Result = $Result; Expected = $Expected
+            Passed = if ($Counts) { $Counts.Total - $Counts.Failed - $Counts.Skipped }
+            Failed = if ($Counts) { $Counts.Failed }
+            Skipped = if ($Counts) { $Counts.Skipped }
+            Verify = $Verify; Seconds = $Seconds; Note = $Note
         }
-        Invoke-ChildTest -Name $c.Name -BuildFile $bs.FullName -ResultFile (Join-Path $out "$($c.Name).junit.xml") -LogFile (Join-Path $out "$($c.Name).log")
     }
+
+    $rows = @(foreach ($c in $Manifest.Children) {
+        if ($Only -and $c.Name -notin $Only) { continue }
+        $e = $c.Expect
+        $expected = if ($e.NoTests) { 'no tests' } elseif ($e.ExpectedFailures) { "$($e.ExpectedFailures) failed" } else { '0 failed' }
+        $verifyCol = if ($c.Verify) { 'not run' } else { 'not applicable' }
+        if (-not $c.BuildScript) { & $row $c.Name 'no build script' '-' $null 'not applicable' $null $null; continue }
+        $path = Join-Path $ReposRoot $c.Name
+        if (-not (Test-Path -LiteralPath (Join-Path $path '.git'))) { & $row $c.Name 'FAIL' $expected $null $verifyCol $null 'not cloned; run Sync'; continue }
+        if (-not (Find-ChildBuildScript $path)) { & $row $c.Name 'FAIL' $expected $null $verifyCol $null 'manifest says build_script but none found'; continue }
+
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $before = $null
+        foreach ($t in $e.TasksBeforeTest) {
+            $exit = Invoke-ChildTask -Path $path -Task $t -LogFile (Join-Path $run "$($c.Name).$t.log")
+            if ($exit -ne 0) { $before = "$t failed (exit $exit); Test not run"; break }
+        }
+        if ($before) { & $row $c.Name 'FAIL' $expected $null $verifyCol ([math]::Round($sw.Elapsed.TotalSeconds, 1)) $before; continue }
+
+        $junit = Join-Path $run "$($c.Name).junit.xml"
+        $exit = Invoke-ChildTask -Path $path -Task Test -LogFile (Join-Path $run "$($c.Name).log") -ResultFile $junit -PesterVersion $pester
+        $counts = Read-JUnitCounts $junit
+        $files = if ($e.NoTests) { @(Get-ChildItem -LiteralPath $path -Recurse -File -Filter '*.Tests.ps1' -ErrorAction SilentlyContinue).Count } else { -1 }
+        $verdict = Get-TestVerdict -ExitCode $exit -Counts $counts -Expect $e -TestFileCount $files
+        $note = $verdict.Note
+        if ($c.Verify) {
+            $v = Invoke-ChildVerify -Name $c.Name -Path $path -Verify $c.Verify -RunFolder $run
+            $verifyCol = $v.Verify
+            $note = (@($note, $v.Note) | Where-Object { $_ }) -join '; '
+        }
+        & $row $c.Name $verdict.Result $expected $counts $verifyCol ([math]::Round($sw.Elapsed.TotalSeconds, 1)) $note
+    })
 
     if (-not $Only -or 'Claude.Framework' -in $Only) {
-        Invoke-ChildTest -Name 'Claude.Framework' -Task SelfTest -BuildFile (Join-Path $FrameworkRoot 'Claude.Framework.build.ps1') `
-            -ResultFile (Join-Path $out 'Claude.Framework.junit.xml') -LogFile (Join-Path $out 'Claude.Framework.log')
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $junit = Join-Path $run 'Claude.Framework.junit.xml'
+        $exit = Invoke-ChildTask -Path $FrameworkRoot -Task SelfTest -LogFile (Join-Path $run 'Claude.Framework.log') -ResultFile $junit `
+            -PesterVersion $pester -Environment @{ FRAMEWORK_FIXTURE_ROOT = (Join-Path $run 'fixtures') }
+        $counts = Read-JUnitCounts $junit
+        $verdict = Get-TestVerdict -ExitCode $exit -Counts $counts -Expect (ConvertTo-ChildExpectation -Name 'Claude.Framework' -Block $null)
+        $rows += & $row 'Claude.Framework' $verdict.Result '0 failed' $counts 'not applicable' ([math]::Round($sw.Elapsed.TotalSeconds, 1)) $verdict.Note
     }
+
+    $rows | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $run 'summary.json')
+    $rows
+}
+
+function Invoke-FrameworkBootstrap {
+    # Runs the run-once script unless <StateRoot>/bootstrap.done exists; -Force runs it again. The marker is
+    # written only after the script succeeds, and records when it ran and which script.
+    param(
+        [Parameter(Mandatory)][string]$StateRoot,
+        [Parameter(Mandatory)][string]$Script,
+        [switch]$Force
+    )
+    $marker = Join-Path $StateRoot 'bootstrap.done'
+    if ((Test-Path -LiteralPath $marker) -and -not $Force) {
+        return [pscustomobject]@{ Action = 'skipped'; Detail = "marker exists: $(Get-Content -LiteralPath $marker -Raw)".Trim() }
+    }
+    if (-not (Test-Path -LiteralPath $StateRoot)) { $null = New-Item -ItemType Directory -Path $StateRoot -Force }
+    & $Script -StateRoot $StateRoot
+    Set-Content -LiteralPath $marker -Value "$(Get-Date -Format o) $Script"
+    [pscustomobject]@{ Action = if ($Force) { 'ran (-Force)' } else { 'ran' }; Detail = "marker written: $marker" }
 }
 
 Export-ModuleMember -Function Get-FrameworkManifest, Test-FrameworkRequirements, Sync-Framework, Sync-FrameworkChild,
-    Get-FrameworkStatus, Invoke-FrameworkTest, Invoke-ChildTest
+    Get-FrameworkStatus, Invoke-FrameworkTest, Invoke-ChildTask, Invoke-ChildVerify, Get-TestVerdict,
+    New-FrameworkRunFolder, Invoke-FrameworkBootstrap

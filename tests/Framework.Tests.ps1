@@ -1,13 +1,21 @@
 #Requires -Version 7.4
-# Fixtures are local bare repos under .framework/test-runs/<stamp>/ (gitignored, inside the repo). No network.
-# The fixture folders are left in place after the run: agents here do not delete.
+# Fixtures are local bare repos and fixture children under .framework/test-runs/<stamp>/ (gitignored, inside the
+# repo), or under $env:FRAMEWORK_FIXTURE_ROOT when the Test task runs this suite. No network. Old run folders are
+# pruned by New-FrameworkRunFolder, the one deletion CLAUDE.md allows.
+
+BeforeDiscovery {
+    # The -ForEach data below reads the manifest at discovery time.
+    Import-Module (Join-Path (Split-Path $PSScriptRoot -Parent) 'build' 'Framework.Build.psm1') -Force
+}
 
 BeforeAll {
     $FrameworkRoot = Split-Path $PSScriptRoot -Parent
     Import-Module (Join-Path $FrameworkRoot 'build' 'Framework.Build.psm1') -Force
 
-    $RunRoot = Join-Path $FrameworkRoot '.framework' 'test-runs' (Get-Date -Format 'yyyyMMdd-HHmmss-fff')
-    $null = New-Item -ItemType Directory -Path $RunRoot -Force
+    $RunRoot = if ($env:FRAMEWORK_FIXTURE_ROOT) {
+        (New-Item -ItemType Directory -Path $env:FRAMEWORK_FIXTURE_ROOT -Force).FullName
+    }
+    else { (New-FrameworkRunFolder -Root (Join-Path $FrameworkRoot '.framework' 'test-runs')).Path }
 
     function G { param([string]$Path) $out = & git -C $Path -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false @args 2>&1; if ($LASTEXITCODE) { throw "git $args : $out" }; $out }
 
@@ -76,6 +84,188 @@ Describe 'framework.yaml' {
         $bad = Join-Path $RunRoot 'bad.yaml'
         Set-Content -LiteralPath $bad -Value "children:`n  - name: X`n    url: https://example.invalid/x.git`n    build_script: false"
         { Get-FrameworkManifest $bad } | Should -Throw '*default_branch*'
+    }
+
+    It 'reads the expect and verify blocks' {
+        $by = @{}; $manifest.Children | ForEach-Object { $by[$_.Name] = $_ }
+        $by['Claude.Portal'].Expect.TasksBeforeTest | Should -Be @('Install')
+        $by['Claude.Ontology'].Expect.ExpectedFailures | Should -Be 16
+        $by['Claude.Ontology'].Expect.Reason | Should -Not -BeNullOrEmpty
+        $by['Claude.Ontology'].Verify.Script | Should -Be 'forge/tools/Invoke-PluginVerify.ps1'
+        $by['Claude.Skills'].Expect.NoTests | Should -BeTrue
+        $by['Claude.Chain'].Expect.ExpectedFailures | Should -Be 0
+        $by['Claude.Chain'].Verify | Should -BeNullOrEmpty
+    }
+
+    It 'rejects expected_failures without a reason' {
+        $bad = Join-Path $RunRoot 'bad-expect.yaml'
+        Set-Content -LiteralPath $bad -Value "children:`n  - name: X`n    url: u`n    default_branch: main`n    build_script: true`n    expect:`n      expected_failures: 2"
+        { Get-FrameworkManifest $bad } | Should -Throw '*reason*'
+    }
+}
+
+Describe 'Test runs each child in its own process' {
+    BeforeAll {
+        $pester = [string](Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Requirements.pester
+        $childRepos = Join-Path $RunRoot 'children'
+        $child = Join-Path $childRepos 'Fixture'
+        $null = New-Item -ItemType Directory -Path (Join-Path $child 'tests') -Force
+        G $child init --quiet --initial-branch=main | Out-Null
+        Set-Content -LiteralPath (Join-Path $child 'FixtureChild.psm1') -Value 'function Get-FixtureChild { $PID }'
+        Set-Content -LiteralPath (Join-Path $child 'Fixture.build.ps1') -Value @'
+Import-Module (Join-Path $BuildRoot 'FixtureChild.psm1')
+task Before { Set-Content -LiteralPath (Join-Path $BuildRoot 'before.txt') -Value 'ran' }
+task Test {
+    Set-Content -LiteralPath (Join-Path $BuildRoot 'proof.txt') -Value "$PID|$((Get-Location).Path)|$([bool](Get-Module FixtureChild))"
+    $config = New-PesterConfiguration
+    $config.Run.Path = Join-Path $BuildRoot 'tests'
+    $config.Run.PassThru = $true
+    $r = Invoke-Pester -Configuration $config
+    if ($r.FailedCount) { throw "$($r.FailedCount) failed" }
+}
+'@
+        Set-Content -LiteralPath (Join-Path $child 'tests' 'Fixture.Tests.ps1') -Value @'
+Describe 'fixture' {
+    It 'passes one' { 1 | Should -Be 1 }
+    It 'passes two' { 2 | Should -Be 2 }
+    It 'fails' { 1 | Should -Be 2 }
+    It 'skips' -Skip { }
+}
+'@
+    }
+
+    It 'runs Test in a fresh pwsh in the child folder and leaves no child module in this session' {
+        $out = Join-Path $RunRoot 'child-out'
+        $null = New-Item -ItemType Directory -Path $out -Force
+        $junit = Join-Path $out 'Fixture.junit.xml'
+        $exit = Invoke-ChildTask -Path $child -Task Test -LogFile (Join-Path $out 'Fixture.log') -ResultFile $junit -PesterVersion $pester
+
+        $exit | Should -Not -Be 0
+        $proofPid, $proofCwd, $loaded = (Get-Content -LiteralPath (Join-Path $child 'proof.txt')) -split '\|'
+        [int]$proofPid | Should -Not -Be $PID
+        $proofCwd | Should -Be (Resolve-Path $child).Path
+        $loaded | Should -Be 'True'
+        Get-Module FixtureChild | Should -BeNullOrEmpty
+        $junit | Should -Exist
+    }
+
+    It 'runs tasks_before_test, reads JUnit and applies the expectation' {
+        $yaml = Join-Path $RunRoot 'fixture.yaml'
+        Set-Content -LiteralPath $yaml -Value @"
+requirements:
+  pester: '$pester'
+children:
+  - name: Fixture
+    url: https://example.invalid/fixture.git
+    default_branch: main
+    build_script: true
+    expect:
+      tasks_before_test: [Before]
+      expected_failures: 1
+      reason: the fixture fails one test on purpose
+"@
+        $root = Join-Path $RunRoot 'framework-root'
+        $rows = @(Invoke-FrameworkTest -Manifest (Get-FrameworkManifest $yaml) -ReposRoot $childRepos -FrameworkRoot $root -Only Fixture)
+
+        $rows.Count | Should -Be 1
+        $rows[0].Result | Should -Be 'pass-with-known'
+        $rows[0].Passed, $rows[0].Failed, $rows[0].Skipped | Should -Be @(2, 1, 1)
+        $rows[0].Verify | Should -Be 'not applicable'
+        Join-Path $child 'before.txt' | Should -Exist
+        $run = @(Get-ChildItem (Join-Path $root '.framework' 'test-runs') -Directory)
+        $run.Count | Should -Be 1
+        Join-Path $run[0].FullName 'Fixture.junit.xml' | Should -Exist
+        Join-Path $run[0].FullName 'Fixture.Before.log' | Should -Exist
+        Get-Module FixtureChild | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'expected-failures arithmetic' {
+    BeforeAll {
+        function E { param([int]$Fail = 0, [switch]$NoTests) [pscustomobject]@{ TasksBeforeTest = @(); ExpectedFailures = $Fail; NoTests = [bool]$NoTests; Reason = 'r' } }
+        function C { param([int]$Total, [int]$Failed, [int]$Skipped = 0) [pscustomobject]@{ Total = $Total; Failed = $Failed; Skipped = $Skipped } }
+    }
+
+    It '<Case>' -ForEach @(
+        @{ Case = 'all pass, none expected -> pass'; Exit = 0; Total = 10; Failed = 0; Expected = 0; Want = 'pass' }
+        @{ Case = 'one failure, none expected -> FAIL'; Exit = 1; Total = 10; Failed = 1; Expected = 0; Want = 'FAIL' }
+        @{ Case = 'failures equal expected -> pass-with-known'; Exit = 1; Total = 578; Failed = 16; Expected = 16; Want = 'pass-with-known' }
+        @{ Case = 'failures below expected -> pass-with-known'; Exit = 1; Total = 578; Failed = 15; Expected = 16; Want = 'pass-with-known' }
+        @{ Case = 'failures above expected -> FAIL'; Exit = 1; Total = 578; Failed = 17; Expected = 16; Want = 'FAIL' }
+        @{ Case = 'expected failures, all pass -> pass'; Exit = 0; Total = 578; Failed = 0; Expected = 16; Want = 'pass' }
+        @{ Case = 'no failures but task failed -> FAIL'; Exit = 1; Total = 10; Failed = 0; Expected = 0; Want = 'FAIL' }
+    ) {
+        (Get-TestVerdict -ExitCode $Exit -Counts (C $Total $Failed) -Expect (E $Expected)).Result | Should -Be $Want
+    }
+
+    It 'no JUnit file is FAIL' {
+        (Get-TestVerdict -ExitCode 1 -Counts $null -Expect (E)).Result | Should -Be 'FAIL'
+    }
+
+    It 'no_tests with no test files is reported as no-tests, even though Pester exits non-zero' {
+        $v = Get-TestVerdict -ExitCode 1 -Counts $null -Expect (E -NoTests) -TestFileCount 0
+        $v.Result | Should -Be 'no-tests'
+        $v.Note | Should -Match 'r'
+    }
+
+    It 'no_tests with test files present is judged normally and says the expectation is stale' {
+        $v = Get-TestVerdict -ExitCode 1 -Counts (C 3 1) -Expect (E -NoTests) -TestFileCount 2
+        $v.Result | Should -Be 'FAIL'
+        $v.Note | Should -Match 'stale'
+    }
+}
+
+Describe 'Bootstrap gate' {
+    It 'runs once, skips while the marker exists, and runs again with -Force' {
+        $state = Join-Path $RunRoot 'bootstrap-state'
+        $script = Join-Path $RunRoot 'bootstrap-fixture.ps1'
+        Set-Content -LiteralPath $script -Value 'param($StateRoot) Add-Content -LiteralPath (Join-Path $StateRoot "count.txt") -Value x'
+        $count = { @(Get-Content -LiteralPath (Join-Path $state 'count.txt')).Count }
+
+        (Invoke-FrameworkBootstrap -StateRoot $state -Script $script).Action | Should -Be 'ran'
+        Join-Path $state 'bootstrap.done' | Should -Exist
+        & $count | Should -Be 1
+
+        (Invoke-FrameworkBootstrap -StateRoot $state -Script $script).Action | Should -Be 'skipped'
+        & $count | Should -Be 1
+
+        (Invoke-FrameworkBootstrap -StateRoot $state -Script $script -Force).Action | Should -Be 'ran (-Force)'
+        & $count | Should -Be 2
+    }
+
+    It 'writes no marker when the script fails' {
+        $state = Join-Path $RunRoot 'bootstrap-fail'
+        $script = Join-Path $RunRoot 'bootstrap-throws.ps1'
+        Set-Content -LiteralPath $script -Value 'param($StateRoot) throw "boom"'
+        { Invoke-FrameworkBootstrap -StateRoot $state -Script $script } | Should -Throw '*boom*'
+        Join-Path $state 'bootstrap.done' | Should -Not -Exist
+    }
+
+    It 'the real placeholder records that it ran' {
+        $state = Join-Path $RunRoot 'bootstrap-real'
+        Invoke-FrameworkBootstrap -StateRoot $state -Script (Join-Path $FrameworkRoot 'build' 'Bootstrap.ps1') | Out-Null
+        Get-Content -LiteralPath (Join-Path $state 'bootstrap.log') | Should -Match 'bootstrap placeholder ran'
+    }
+}
+
+Describe 'test-runs retention' {
+    It 'keeps the newest run folders, the new one included, and leaves other names alone' {
+        $root = Join-Path $RunRoot 'retention'
+        $old = '20200101-000000-001', '20200101-000000-002', '20200101-000000-003', '20200101-000000-004',
+            '20200101-000000-005', '20200101-000000-006', '20200101-000000-007'
+        foreach ($n in $old + 'not-a-run') { $null = New-Item -ItemType Directory -Path (Join-Path $root $n) -Force }
+        Set-Content -LiteralPath (Join-Path $root '20200101-000000-001' 'f.txt') -Value x
+
+        $r = New-FrameworkRunFolder -Root $root -Keep 5
+        $r.Pruned | Sort-Object | Should -Be @('20200101-000000-001', '20200101-000000-002', '20200101-000000-003')
+        $left = @(Get-ChildItem -LiteralPath $root -Directory).Name | Sort-Object
+        $left | Should -Contain 'not-a-run'
+        $left | Should -Contain (Split-Path $r.Path -Leaf)
+        @($left | Where-Object { $_ -match '^\d{8}-\d{6}-\d{3}$' }).Count | Should -Be 5
+    }
+
+    It 'refuses to keep fewer than one' {
+        { New-FrameworkRunFolder -Root (Join-Path $RunRoot 'retention0') -Keep 0 } | Should -Throw
     }
 }
 
