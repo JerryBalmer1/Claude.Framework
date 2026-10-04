@@ -8,3 +8,4 @@ CLAUDE.md text eol=lf
 *.html text eol=lf
 .gitignore text eol=lf
 .gitattributes text eol=lf
+*.yaml text eol=lf

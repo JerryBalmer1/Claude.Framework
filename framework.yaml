@@ -1,0 +1,43 @@
+# Manifest of the child repos. Sync clones each into repos/<name>.
+# Claude.Ontology is the renamed Claude.Ontology.Plugins. Claude.Ontology.Old is the archive and is not listed.
+
+requirements:
+  powershell: '7.4'
+  pester: '6.2.0'          # Claude.Skills needs >=6.2.0; Chain and Portal need >=5.5.0
+  powershell_yaml: '0.4.12' # parses this file
+
+children:
+  - name: Claude.Root
+    url: https://github.com/JerryBalmer1/Claude.Root.git
+    default_branch: main
+    build_script: false
+
+  - name: Claude.Chain
+    url: https://github.com/JerryBalmer1/Claude.Chain.git
+    default_branch: main
+    build_script: true
+
+  - name: Claude.Substrate
+    url: https://github.com/JerryBalmer1/Claude.Substrate.git
+    default_branch: main
+    build_script: false
+
+  - name: Claude.Modules
+    url: https://github.com/JerryBalmer1/Claude.Modules.git
+    default_branch: main
+    build_script: false
+
+  - name: Claude.Skills
+    url: https://github.com/JerryBalmer1/Claude.Skills.git
+    default_branch: develop
+    build_script: true
+
+  - name: Claude.Ontology
+    url: https://github.com/JerryBalmer1/Claude.Ontology.git
+    default_branch: main
+    build_script: true
+
+  - name: Claude.Portal
+    url: https://github.com/JerryBalmer1/Claude.Portal.git
+    default_branch: main
+    build_script: true
