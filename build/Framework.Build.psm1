@@ -80,6 +80,85 @@ function ConvertTo-ChildResultFile {
     [string]$Value
 }
 
+function Test-RelativePath {
+    # True for a relative path that never climbs out of its root: not rooted, no '..' segment.
+    param([string]$Path)
+    $Path -and -not [IO.Path]::IsPathRooted($Path) -and $Path -notmatch '^[\\/]' -and -not (@($Path -split '[\\/]') -contains '..')
+}
+
+function ConvertTo-FrameworkGetter {
+    # One getters entry. name, order, cadence and entry are required; path is required unless entry is none.
+    # path is relative to repos/ (CLAUDE.md: a getter runs only from under repos/), so it may not be rooted or climb.
+    # entry is none, or a mapping: script (a .ps1 under tools/) and optional parameters, whose values may hold
+    # {out}, {previous}, {framework_root} and {repos_root}.
+    param($Block)
+    if ($Block -isnot [System.Collections.IDictionary]) { throw "Manifest getters: each entry must be a mapping." }
+    $name = $Block['name']
+    foreach ($field in 'name', 'order', 'cadence', 'entry') {
+        if (-not $Block.Contains($field) -or $null -eq $Block[$field] -or "$($Block[$field])" -eq '') { throw "Manifest getter '$name' is missing '$field'." }
+    }
+    $unknown = @($Block.Keys | Where-Object { $_ -notin 'name', 'path', 'entry', 'tests', 'expects', 'cadence', 'order', 'note' })
+    if ($unknown) { throw "Manifest getter '$name': unknown key(s) $($unknown -join ', ')." }
+    if (($Block.order -isnot [int] -and $Block.order -isnot [long]) -or $Block.order -lt 0) { throw "Manifest getter '$name': order must be a whole number >= 0." }
+    if ("$($Block.cadence)" -notin 'every', 'weekly') { throw "Manifest getter '$name': cadence must be every or weekly, not '$($Block.cadence)'." }
+
+    $entry = $null
+    if ($Block.entry -is [System.Collections.IDictionary]) {
+        $script = [string]$Block.entry['script']
+        if ($script -notmatch '^tools[\\/][^\\/].*\.ps1$' -or -not (Test-RelativePath $script)) { throw "Manifest getter '$name': entry.script must be a .ps1 under tools/, not '$script'." }
+        $params = [ordered]@{}
+        if ($null -ne $Block.entry['parameters']) {
+            if ($Block.entry.parameters -isnot [System.Collections.IDictionary]) { throw "Manifest getter '$name': entry.parameters must be a mapping." }
+            foreach ($k in $Block.entry.parameters.Keys) { $params[[string]$k] = $Block.entry.parameters[$k] }
+        }
+        $entry = [pscustomobject]@{ Script = $script -replace '\\', '/'; Parameters = $params }
+    }
+    elseif ("$($Block.entry)" -ne 'none') { throw "Manifest getter '$name': entry must be none or a mapping with script." }
+
+    $path = $Block['path']
+    if ($entry -and ($null -eq $path -or "$path" -eq '')) { throw "Manifest getter '$name' is missing 'path'." }
+    if ($null -ne $path -and -not (Test-RelativePath ([string]$path))) { throw "Manifest getter '$name': path must be relative to repos/ and stay under it, not '$path'." }
+
+    $tests = $false
+    if ($Block.Contains('tests')) {
+        if ($Block.tests -isnot [bool]) { throw "Manifest getter '$name': tests must be true or false." }
+        $tests = $Block.tests
+    }
+    if ($null -ne $Block['expects']) {
+        if ($Block.expects -isnot [System.Collections.IDictionary]) { throw "Manifest getter '$name': expects must be a mapping." }
+        $bad = @($Block.expects.Keys | Where-Object { $_ -notin 'expected_failures', 'no_tests', 'reason' })
+        if ($bad) { throw "Manifest getter '$name': unknown expects key(s) $($bad -join ', ')." }
+    }
+    [pscustomobject]@{
+        Name    = [string]$name
+        Path    = if ($null -ne $path) { [string]$path }
+        Entry   = $entry
+        Tests   = $tests
+        Expect  = ConvertTo-ChildExpectation -Name $name -Block $Block['expects']
+        Cadence = [string]$Block.cadence
+        Order   = [int]$Block.order
+        Note    = if ($Block['note']) { [string]$Block.note }
+    }
+}
+
+function ConvertTo-FrameworkGetters {
+    # The getters list, sorted by order. Names and orders are unique, no getter shares a child's name, and Diff,
+    # which compares one heartbeat with the one before, has the highest order.
+    param($List, [string[]]$ChildNames)
+    if ($null -eq $List) { return @() }
+    $getters = @(foreach ($g in @($List)) { ConvertTo-FrameworkGetter $g })
+    $dupes = $getters | Group-Object Name | Where-Object Count -gt 1
+    if ($dupes) { throw "Manifest has duplicate getter names: $($dupes.Name -join ', ')" }
+    $clash = @($getters.Name | Where-Object { $_ -in @($ChildNames) + 'Claude.Framework' })
+    if ($clash) { throw "Manifest getter name(s) $($clash -join ', ') also name a child." }
+    $same = $getters | Group-Object Order | Where-Object Count -gt 1
+    if ($same) { throw "Manifest getters share an order: $(@($same | ForEach-Object { "$($_.Name) ($($_.Group.Name -join ', '))" }) -join '; ')" }
+    $sorted = @($getters | Sort-Object Order)
+    $diff = $sorted | Where-Object Name -eq 'Diff'
+    if ($diff -and $sorted[-1].Name -ne 'Diff') { throw "Manifest getter Diff must be last (highest order); $($sorted[-1].Name) has order $($sorted[-1].Order), Diff $($diff.Order)." }
+    $sorted
+}
+
 function Get-FrameworkManifest {
     param([Parameter(Mandatory)][string]$Path)
     Import-Module powershell-yaml -ErrorAction Stop
@@ -106,8 +185,9 @@ function Get-FrameworkManifest {
     $dupes = $children | Group-Object Name | Where-Object Count -gt 1
     if ($dupes) { throw "Manifest has duplicate names: $($dupes.Name -join ', ')" }
     [pscustomobject]@{
-        Requirements = $raw.requirements
+        Requirements = $raw['requirements']
         Children     = @($children)
+        Getters      = @(ConvertTo-FrameworkGetters -List $raw['getters'] -ChildNames @($children | ForEach-Object Name))
     }
 }
 
@@ -505,24 +585,27 @@ function New-FrameworkRunFolder {
 }
 
 function Get-FrameworkTestPlan {
-    # One row per child, then Claude.Framework: the task Test would run there and whether this run selects it.
+    # One row per child, then Claude.Framework: the task Test would run there, whether this run selects it, and
+    # Verify: run (declared, and -Verify), heartbeat (declared; Heartbeat runs it) or not applicable.
     # -Full picks full_test_task where a child declares one, test_task elsewhere. An unknown -Only name throws,
     # listing the valid names, so a typo fails before any child runs.
-    param([Parameter(Mandatory)]$Manifest, [string[]]$Only, [switch]$Full)
+    param([Parameter(Mandatory)]$Manifest, [string[]]$Only, [switch]$Full, [switch]$Verify)
     $valid = @($Manifest.Children | ForEach-Object Name) + 'Claude.Framework'
     $unknown = @($Only | Where-Object { $_ -and $_ -notin $valid })
     if ($unknown) { throw "Unknown -Only name(s): $($unknown -join ', '). Valid names: $($valid -join ', ')." }
     $selected = { param($n) -not $Only -or $n -in $Only }
     foreach ($c in $Manifest.Children) {
         $task = if (-not $c.BuildScript) { $null } elseif ($Full -and $c.Expect.FullTestTask) { $c.Expect.FullTestTask } else { $c.Expect.TestTask }
-        [pscustomobject]@{ Name = $c.Name; Task = $task; Selected = (& $selected $c.Name); Child = $c }
+        $v = if (-not $c.Verify -or -not $c.BuildScript) { 'not applicable' } elseif ($Verify) { 'run' } else { 'heartbeat' }
+        [pscustomobject]@{ Name = $c.Name; Task = $task; Selected = (& $selected $c.Name); Verify = $v; Child = $c }
     }
-    [pscustomobject]@{ Name = 'Claude.Framework'; Task = 'SelfTest'; Selected = (& $selected 'Claude.Framework'); Child = $null }
+    [pscustomobject]@{ Name = 'Claude.Framework'; Task = 'SelfTest'; Selected = (& $selected 'Claude.Framework'); Verify = 'not applicable'; Child = $null }
 }
 
 function Write-ChildRunRecord {
     # <Name>.result.json next to the child's JUnit file: what was tested (commit, dirty, branch, when, which task),
-    # what was expected, what happened.
+    # what was expected, what happened. verify is ran, skipped (left to Heartbeat) or not applicable; verify_outcome
+    # is reproduces or does not when it ran.
     param(
         [Parameter(Mandatory)][string]$RunFolder,
         [Parameter(Mandatory)]$Row,
@@ -540,7 +623,8 @@ function Write-ChildRunRecord {
         result    = $Row.Result
         expected  = [ordered]@{ failures = $Expect.ExpectedFailures; no_tests = $Expect.NoTests; reason = $Expect.Reason }
         actual    = [ordered]@{ passed = $Row.Passed; failed = $Row.Failed; skipped = $Row.Skipped }
-        verify    = $Row.Verify
+        verify    = switch ($Row.Verify) { 'not applicable' { 'not applicable' } { $_ -in 'heartbeat', 'not run' } { 'skipped' } default { 'ran' } }
+        verify_outcome = if ($Row.Verify -in 'reproduces', 'does not') { $Row.Verify }
         seconds   = $Row.Seconds
         note      = $Row.Note
     } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $RunFolder "$($Row.Name).result.json")
@@ -549,6 +633,7 @@ function Write-ChildRunRecord {
 function Invoke-FrameworkTest {
     # Runs every child that has a build script through its own test task in a fresh pwsh, then Framework's SelfTest.
     # -Only runs just those names; every child still gets a row. -Full runs full_test_task where one is declared.
+    # Verify is Heartbeat's: a child that declares it shows 'heartbeat' unless -Verify runs it here.
     # Results, logs, JUnit files and one <Name>.result.json per tested child go to .framework/test-runs/<stamp>/.
     param(
         [Parameter(Mandatory)]$Manifest,
@@ -556,9 +641,10 @@ function Invoke-FrameworkTest {
         [Parameter(Mandatory)][string]$FrameworkRoot,
         [string[]]$Only,
         [switch]$Full,
+        [switch]$Verify,
         [int]$KeepRuns = 5
     )
-    $plan = @(Get-FrameworkTestPlan -Manifest $Manifest -Only $Only -Full:$Full)
+    $plan = @(Get-FrameworkTestPlan -Manifest $Manifest -Only $Only -Full:$Full -Verify:$Verify)
     $pester = [string]$Manifest.Requirements.pester
     $run = (New-FrameworkRunFolder -Root (Join-Path $FrameworkRoot '.framework' 'test-runs') -Keep $KeepRuns).Path
     $row = {
@@ -581,9 +667,9 @@ function Invoke-FrameworkTest {
         $e = $c.Expect
         $task = $p.Task
         $expected = if ($e.NoTests) { 'no tests' } elseif ($e.ExpectedFailures) { "$($e.ExpectedFailures) failed" } else { '0 failed' }
-        $verifyCol = if ($c.Verify) { 'not run' } else { 'not applicable' }
+        $verifyCol = switch ($p.Verify) { 'run' { 'not run' } default { $_ } }
         if (-not $c.BuildScript) { & $row $c.Name 'no build script' '-' $null 'not applicable' $null $null; continue }
-        if (-not $p.Selected) { & $row $c.Name 'skipped (-Only)' $expected $null $verifyCol $null $null $task; continue }
+        if (-not $p.Selected) { & $row $c.Name 'skipped (-Only)' $expected $null $(if ($c.Verify) { 'not run' } else { 'not applicable' }) $null $null $task; continue }
         $path = Join-Path $ReposRoot $c.Name
         if (-not (Test-Path -LiteralPath (Join-Path $path '.git'))) { & $row $c.Name 'FAIL' $expected $null $verifyCol $null 'not cloned; run Sync' $task; continue }
         if (-not (Find-ChildBuildScript $path)) { & $row $c.Name 'FAIL' $expected $null $verifyCol $null 'manifest says build_script but none found' $task; continue }
@@ -627,7 +713,7 @@ function Invoke-FrameworkTest {
             $branch = $checkout.Branch
             $note += "; checkout on $branch" + $(if ($branch -ne $c.DefaultBranch) { ", not default_branch $($c.DefaultBranch)" })
         }
-        if ($c.Verify) {
+        if ($p.Verify -eq 'run') {
             $v = Invoke-ChildVerify -Name $c.Name -Path $path -Verify $c.Verify -RunFolder $run
             $verifyCol = $v.Verify
             $note = (@($note, $v.Note) | Where-Object { $_ }) -join '; '
@@ -658,6 +744,272 @@ function Invoke-FrameworkTest {
     $rows
 }
 
+function Get-StampFolders {
+    # Folders under $Root named like a run stamp (yyyyMMdd-HHmmss-fff), newest first.
+    param([string]$Root)
+    if (-not $Root -or -not (Test-Path -LiteralPath $Root)) { return @() }
+    @(Get-ChildItem -LiteralPath $Root -Directory | Where-Object Name -match '^\d{8}-\d{6}-\d{3}$' | Sort-Object Name -Descending)
+}
+
+function Get-CheckoutOrNone {
+    # Get-ChildCheckout, or $null where $Path is missing or not in a git work tree.
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $null }
+    if ((Invoke-Git $Path rev-parse --is-inside-work-tree -AllowFail).ExitCode -ne 0) { return $null }
+    Get-ChildCheckout $Path
+}
+
+function Read-RunRecordFields {
+    # Fields of a <Name>.result.json, read through JsonNode so tested_at stays the string it was written as.
+    param([Parameter(Mandatory)][string]$Path)
+    $n = [System.Text.Json.Nodes.JsonNode]::Parse((Get-Content -LiteralPath $Path -Raw))
+    $o = [ordered]@{}
+    foreach ($k in 'name', 'task', 'commit', 'dirty', 'branch', 'tested_at', 'result', 'verify', 'verify_outcome') {
+        $v = if ($n.AsObject().ContainsKey($k)) { $n[$k] }
+        $o[$k] = if ($null -eq $v) { $null } elseif ($k -eq 'dirty') { $v.ToString() -eq 'true' } else { $v.ToString() }
+    }
+    $o
+}
+
+function Set-RunRecordVerify {
+    # Marks a child's run record verify: ran, with the outcome and the heartbeat that ran it. Other fields are untouched.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Outcome, [Parameter(Mandatory)][string]$By)
+    $n = [System.Text.Json.Nodes.JsonNode]::Parse((Get-Content -LiteralPath $Path -Raw))
+    $n['verify'] = [System.Text.Json.Nodes.JsonValue]::Create([string]'ran')
+    $n['verify_outcome'] = [System.Text.Json.Nodes.JsonValue]::Create([string]$Outcome)
+    $n['verify_by'] = [System.Text.Json.Nodes.JsonValue]::Create([string]$By)
+    Set-Content -LiteralPath $Path -Value $n.ToJsonString([System.Text.Json.JsonSerializerOptions]@{ WriteIndented = $true })
+}
+
+function Get-GetterInvocation {
+    # A getter entry's parameters with {out}, {previous}, {framework_root} and {repos_root} filled in, and the line
+    # that records what ran.
+    param([Parameter(Mandatory)]$Entry, [Parameter(Mandatory)][hashtable]$Values)
+    $params = [ordered]@{}
+    foreach ($k in $Entry.Parameters.Keys) {
+        $v = $Entry.Parameters[$k]
+        if ($v -is [string]) { foreach ($t in $Values.Keys) { $v = $v.Replace("{$t}", [string]$Values[$t]) } }
+        $params[$k] = $v
+    }
+    $parts = foreach ($k in $params.Keys) {
+        $v = $params[$k]
+        if ($v -is [bool]) { if ($v) { "-$k" } else { "-${k}:`$false" } }
+        else { "-$k '" + ("$v" -replace "'", "''") + "'" }
+    }
+    [pscustomobject]@{ Parameters = $params; Line = (@("& ./$($Entry.Script)") + @($parts)) -join ' ' }
+}
+
+function Invoke-FrameworkHeartbeat {
+    # Test (or, with -SkipUp, the newest test run reused), then Verify for every child that declares it, then each
+    # getter by order in its own fresh pwsh rooted in its path under repos/, its Pester when tests: true, Diff last
+    # against the previous heartbeat. A failing getter is recorded and the next one runs. Output, logs and one
+    # <getter>.result.json per getter go to .framework/heartbeats/<stamp>/, which keeps the latest -KeepRuns folders;
+    # heartbeat.json at its root is the record. -Only names children and/or getters; anything not named is skipped.
+    # Failures lists every getter fail, child Test FAIL and Verify 'does not'; the build fails the task on any.
+    param(
+        [Parameter(Mandatory)]$Manifest,
+        [Parameter(Mandatory)][string]$ReposRoot,
+        [Parameter(Mandatory)][string]$FrameworkRoot,
+        [string[]]$Only,
+        [switch]$Full,
+        [switch]$SkipUp,
+        [int]$KeepRuns = 5
+    )
+    $getters = @($Manifest.Getters)
+    $childNames = @($Manifest.Children | ForEach-Object Name) + 'Claude.Framework'
+    $valid = $childNames + @($getters | ForEach-Object Name)
+    $unknown = @($Only | Where-Object { $_ -and $_ -notin $valid })
+    if ($unknown) { throw "Unknown -Only name(s): $($unknown -join ', '). Valid names: $($valid -join ', ')." }
+    $selected = { param($n) -not $Only -or $n -in $Only }
+    $onlyChildren = @($Only | Where-Object { $_ -in $childNames })
+    $pester = [string]$Manifest.Requirements.pester
+    $runsRoot = Join-Path $FrameworkRoot '.framework' 'test-runs'
+    $hbRoot = Join-Path $FrameworkRoot '.framework' 'heartbeats'
+    $now = { [DateTimeOffset]::Now.ToString('yyyy-MM-ddTHH:mm:sszzz') }
+
+    # Checked before the heartbeat folder exists, so a run with nothing to reuse leaves nothing behind.
+    $reuse = if ($SkipUp) { '-SkipUp' } elseif ($Only -and -not $onlyChildren) { '-Only names no child' }
+    $usedRun = $null
+    if ($reuse) {
+        $usedRun = Get-StampFolders $runsRoot | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'summary.json') } | Select-Object -First 1
+        if (-not $usedRun) { throw "Heartbeat ($reuse): no test run with a summary.json under $runsRoot to reuse; run Test first." }
+    }
+
+    # When each weekly getter last ran, from the heartbeats kept so far.
+    $lastRan = @{}
+    foreach ($f in Get-StampFolders $hbRoot) {
+        $file = Join-Path $f.FullName 'heartbeat.json'
+        if (-not (Test-Path -LiteralPath $file)) { continue }
+        foreach ($g in @((Get-Content -LiteralPath $file -Raw | ConvertFrom-Json).getters)) {
+            if ($g.result -in 'pass', 'fail' -and -not $lastRan.ContainsKey($g.name)) { $lastRan[$g.name] = [datetimeoffset]$g.tested_at }
+        }
+    }
+
+    $folder = (New-FrameworkRunFolder -Root $hbRoot -Keep $KeepRuns).Path
+    $stamp = Split-Path $folder -Leaf
+    $previous = Get-StampFolders $hbRoot | Where-Object Name -ne $stamp | Select-Object -First 1
+
+    if ($reuse) {
+        $testRows = @(Get-Content -LiteralPath (Join-Path $usedRun.FullName 'summary.json') -Raw | ConvertFrom-Json)
+    }
+    else {
+        $testRows = @(Invoke-FrameworkTest -Manifest $Manifest -ReposRoot $ReposRoot -FrameworkRoot $FrameworkRoot -Only $onlyChildren -Full:$Full -KeepRuns $KeepRuns)
+        $usedRun = Get-StampFolders $runsRoot | Select-Object -First 1
+    }
+
+    $verifyRows = @(foreach ($c in @($Manifest.Children | Where-Object { $_.Verify -and $_.BuildScript })) {
+        $vr = { param($Result, $Commit, $Seconds, $Note) [pscustomobject]@{ Name = $c.Name; Verify = $Result; Commit = $Commit; Seconds = $Seconds; Note = $Note } }
+        if (-not (& $selected $c.Name)) { & $vr 'skipped (-Only)' '-' $null $null; continue }
+        $path = Join-Path $ReposRoot $c.Name
+        if (-not (Test-Path -LiteralPath (Join-Path $path '.git'))) { & $vr 'not run' '-' $null 'not cloned; run Sync'; continue }
+        $verifyRoot = Join-Path $folder 'verify'
+        $null = New-Item -ItemType Directory -Path $verifyRoot -Force
+        $checkout = Get-ChildCheckout $path
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $v = Invoke-ChildVerify -Name $c.Name -Path $path -Verify $c.Verify -RunFolder $verifyRoot
+        $note = $v.Note
+        $record = Join-Path $usedRun.FullName "$($c.Name).result.json"
+        if (Test-Path -LiteralPath $record) { Set-RunRecordVerify -Path $record -Outcome $v.Verify -By "heartbeat $stamp" }
+        else { $note += "; test run $($usedRun.Name) has no $($c.Name).result.json to update" }
+        & $vr $v.Verify (Format-ShortCommit $checkout.Commit $checkout.Dirty) ([math]::Round($sw.Elapsed.TotalSeconds, 1)) $note
+    })
+
+    $getterScript = @'
+param($ScriptPath, $ParamsJson)
+$p = if ($ParamsJson) { $ParamsJson | ConvertFrom-Json -AsHashtable } else { @{} }
+$global:LASTEXITCODE = 0
+& (Join-Path $PWD $ScriptPath) @p
+if ($LASTEXITCODE) { exit $LASTEXITCODE }
+'@
+    $testScript = @'
+param($TestsPath, $ResultFile, $PesterVersion)
+if ($PesterVersion) { Import-Module Pester -RequiredVersion $PesterVersion -ErrorAction Stop } else { Import-Module Pester -ErrorAction Stop }
+$c = New-PesterConfiguration
+$c.Run.Path = $TestsPath
+$c.Run.PassThru = $true
+$c.TestResult.Enabled = $true
+$c.TestResult.OutputFormat = 'JUnitXml'
+$c.TestResult.OutputPath = $ResultFile
+$r = Invoke-Pester -Configuration $c
+if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
+'@
+    $graded = Get-CheckoutOrNone $FrameworkRoot
+    $diffVerdict = $null
+    $records = [System.Collections.Generic.List[object]]::new()
+    $getterRows = @(foreach ($g in $getters) {
+        $testedAt = & $now
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $path = if ($g.Path) { Join-Path $ReposRoot $g.Path }
+        $checkout = Get-CheckoutOrNone $path
+        $line = $null; $counts = $null; $seconds = $null
+        $result, $note = if (-not (& $selected $g.Name)) { 'skipped', '-Only' }
+        elseif (-not $g.Entry) { 'not runnable', ((@('entry: none', $g.Note) | Where-Object { $_ }) -join '; ') }
+        elseif (-not (Test-Path -LiteralPath $path -PathType Container)) { 'not runnable', "repos/$($g.Path) not found" }
+        elseif ($g.Cadence -eq 'weekly' -and $g.Name -notin @($Only) -and $lastRan.ContainsKey($g.Name) -and $lastRan[$g.Name] -gt [DateTimeOffset]::Now.AddDays(-7)) {
+            'skipped', "weekly; last ran $($lastRan[$g.Name].ToString('yyyy-MM-dd HH:mm'))"
+        }
+        else { $null, $null }
+
+        if (-not $result) {
+            $out = Join-Path $folder $g.Name
+            $null = New-Item -ItemType Directory -Path $out -Force
+            $inv = Get-GetterInvocation -Entry $g.Entry -Values @{
+                out = $out; previous = if ($previous) { $previous.FullName } else { '' }; framework_root = $FrameworkRoot; repos_root = $ReposRoot
+            }
+            $line = $inv.Line
+            $notes = [System.Collections.Generic.List[string]]::new()
+            if ($g.Note) { $notes.Add($g.Note) }
+            $exit = Invoke-ChildProcess -WorkingDirectory $path -Script $getterScript -ArgumentList $g.Entry.Script, ($inv.Parameters | ConvertTo-Json -Compress -Depth 4) -LogFile (Join-Path $folder "$($g.Name).log")
+            if ($exit -ne 0) { $notes.Add("entry exit $exit") }
+            $verdict = $null
+            if ($g.Tests) {
+                $junit = Join-Path $out "$($g.Name).junit.xml"
+                $testsPath = if (Test-Path -LiteralPath (Join-Path $path 'tests') -PathType Container) { Join-Path $path 'tests' } else { $path }
+                $texit = Invoke-ChildProcess -WorkingDirectory $path -Script $testScript -ArgumentList $testsPath, $junit, $pester -LogFile (Join-Path $folder "$($g.Name).tests.log")
+                $counts = Read-JUnitCounts $junit
+                $files = if ($g.Expect.NoTests) { @(Get-ChildItem -LiteralPath $path -Recurse -File -Filter '*.Tests.ps1' -ErrorAction SilentlyContinue).Count } else { -1 }
+                $verdict = Get-TestVerdict -ExitCode $texit -Counts $counts -Expect $g.Expect -TestFileCount $files
+                if ($verdict.Note) { $notes.Add("tests $($verdict.Result): $($verdict.Note)") }
+            }
+            $result = if ($exit -ne 0 -or ($verdict -and $verdict.Result -eq 'FAIL')) { 'fail' } else { 'pass' }
+            if ($g.Name -eq 'Diff') {
+                if (-not $previous) { $notes.Add('no previous heartbeat') }
+                # The first line of verdict.txt in Diff's output, else the last line Diff printed.
+                $vf = Join-Path $out 'verdict.txt'
+                $lines = if (Test-Path -LiteralPath $vf) { @(Get-Content -LiteralPath $vf) } else { @(Get-Content -LiteralPath (Join-Path $folder 'Diff.log') -ErrorAction SilentlyContinue) }
+                $lines = @($lines | Where-Object { "$_".Trim() })
+                $diffVerdict = if ($lines) { if (Test-Path -LiteralPath $vf) { "$($lines[0])".Trim() } else { "$($lines[-1])".Trim() } }
+            }
+            $note = $notes -join '; '
+            $seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+        }
+
+        $rec = [ordered]@{
+            name          = $g.Name
+            result        = $result
+            getter_commit = if ($checkout) { $checkout.Commit }
+            getter_dirty  = if ($checkout) { $checkout.Dirty }
+            graded_commit = if ($graded) { $graded.Commit }
+            graded_dirty  = if ($graded) { $graded.Dirty }
+            passed        = if ($counts) { $counts.Total - $counts.Failed - $counts.Skipped }
+            failed        = if ($counts) { $counts.Failed }
+            seconds       = $seconds
+            note          = $note
+            tested_at     = $testedAt
+            entry_line    = $line
+            cadence       = $g.Cadence
+            order         = $g.Order
+        }
+        $rec | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $folder "$($g.Name).result.json")
+        $records.Add($rec)
+        [pscustomobject]@{
+            Name         = $g.Name
+            Result       = $result
+            GetterCommit = if ($checkout) { Format-ShortCommit $checkout.Commit $checkout.Dirty } else { '-' }
+            GradedCommit = if ($graded) { Format-ShortCommit $graded.Commit $graded.Dirty } else { '-' }
+            Passed       = $rec.passed
+            Failed       = $rec.failed
+            Seconds      = $seconds
+            Note         = $note
+        }
+    })
+
+    $children = @(foreach ($c in $Manifest.Children) {
+        $file = Join-Path $usedRun.FullName "$($c.Name).result.json"
+        if (Test-Path -LiteralPath $file) { Read-RunRecordFields $file; continue }
+        $row = $testRows | Where-Object Name -eq $c.Name | Select-Object -First 1
+        [ordered]@{ name = $c.Name; commit = $null; result = if ($row) { $row.Result } else { 'no record' } }
+    })
+    $failures = @(
+        @($testRows | Where-Object Result -eq 'FAIL' | ForEach-Object { "test $($_.Name)" })
+        @($verifyRows | Where-Object Verify -eq 'does not' | ForEach-Object { "verify $($_.Name)" })
+        @($getterRows | Where-Object Result -eq 'fail' | ForEach-Object { "getter $($_.Name)" })
+    )
+    $testRun = [ordered]@{ folder = $usedRun.Name; reused = [bool]$reuse; reason = $reuse }
+    [ordered]@{
+        stamp     = $stamp
+        framework = [ordered]@{ commit = if ($graded) { $graded.Commit }; dirty = if ($graded) { $graded.Dirty }; branch = if ($graded) { $graded.Branch } }
+        test_run  = $testRun
+        previous  = if ($previous) { $previous.Name }
+        children  = $children
+        verify    = @($verifyRows | ForEach-Object { [ordered]@{ name = $_.Name; verify = $_.Verify; commit = $_.Commit; seconds = $_.Seconds; note = $_.Note } })
+        getters   = @($records)
+        diff      = $diffVerdict
+        failures  = $failures
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $folder 'heartbeat.json')
+
+    [pscustomobject]@{
+        Folder     = $folder
+        Stamp      = $stamp
+        TestRun    = [pscustomobject]$testRun
+        TestRows   = $testRows
+        VerifyRows = $verifyRows
+        Getters    = $getterRows
+        Diff       = $diffVerdict
+        Failures   = $failures
+    }
+}
+
 function Invoke-FrameworkBootstrap {
     # Runs the run-once script unless <StateRoot>/bootstrap.done exists; -Force runs it again. The marker is
     # written only after the script succeeds, and records when it ran and which script.
@@ -678,4 +1030,4 @@ function Invoke-FrameworkBootstrap {
 
 Export-ModuleMember -Function Get-FrameworkManifest, Test-FrameworkRequirements, Sync-Framework, Sync-FrameworkChild,
     Get-FrameworkStatus, Get-FrameworkTestPlan, Invoke-FrameworkTest, Invoke-ChildTask, Invoke-ChildVerify, Get-TestVerdict,
-    New-FrameworkRunFolder, Invoke-FrameworkBootstrap
+    New-FrameworkRunFolder, Invoke-FrameworkBootstrap, Invoke-FrameworkHeartbeat

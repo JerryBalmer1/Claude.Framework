@@ -134,6 +134,300 @@ Describe 'framework.yaml' {
     }
 }
 
+Describe 'framework.yaml getters' {
+    BeforeAll {
+        $base = "children:`n  - name: X`n    url: u`n    default_branch: main`n    build_script: false`ngetters:`n"
+        function Write-Getters { param([string]$Name, [string]$Body) $p = Join-Path $RunRoot "getters-$Name.yaml"; Set-Content -LiteralPath $p -Value ($base + $Body); $p }
+        $ok = "  - name: A`n    path: getters/A`n    entry:`n      script: tools/Run.ps1`n    cadence: every`n    order: 1"
+    }
+
+    It 'registers the six getters as entry: none, no path, not promoted yet, Diff last' {
+        $g = (Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Getters
+        $g.Name | Should -Be @('Catalogue', 'Hardening', 'Incidents', 'Shape', 'Secrets', 'Diff')
+        foreach ($x in $g) {
+            $x.Entry | Should -BeNullOrEmpty
+            $x.Path | Should -BeNullOrEmpty
+            $x.Note | Should -Be 'not promoted to repos/ yet'
+        }
+    }
+
+    It 'reads a runnable getter' {
+        $g = (Get-FrameworkManifest (Write-Getters 'ok' $ok)).Getters
+        $g.Count | Should -Be 1
+        $g[0].Entry.Script | Should -Be 'tools/Run.ps1'
+        $g[0].Path | Should -Be 'getters/A'
+        $g[0].Tests | Should -BeFalse
+    }
+
+    It 'a getter missing <Field> fails to load' -ForEach @(
+        @{ Field = 'name'; Body = "  - path: getters/A`n    entry: none`n    cadence: every`n    order: 1" }
+        @{ Field = 'order'; Body = "  - name: A`n    entry: none`n    cadence: every" }
+        @{ Field = 'cadence'; Body = "  - name: A`n    entry: none`n    order: 1" }
+        @{ Field = 'path'; Body = "  - name: A`n    entry:`n      script: tools/Run.ps1`n    cadence: every`n    order: 1" }
+    ) {
+        { Get-FrameworkManifest (Write-Getters "missing-$Field" $Body) } | Should -Throw "*missing '$Field'*"
+    }
+
+    It 'a path outside repos/ fails to load' {
+        $body = "  - name: A`n    path: C:\elsewhere\A`n    entry:`n      script: tools/Run.ps1`n    cadence: every`n    order: 1"
+        { Get-FrameworkManifest (Write-Getters 'rooted' $body) } | Should -Throw '*under it*'
+        $body = "  - name: A`n    path: ../A`n    entry:`n      script: tools/Run.ps1`n    cadence: every`n    order: 1"
+        { Get-FrameworkManifest (Write-Getters 'climb' $body) } | Should -Throw '*under it*'
+    }
+
+    It 'two getters with the same order fail to load' {
+        $body = "  - name: A`n    entry: none`n    cadence: every`n    order: 1`n  - name: B`n    entry: none`n    cadence: weekly`n    order: 1"
+        { Get-FrameworkManifest (Write-Getters 'same-order' $body) } | Should -Throw '*share an order*'
+    }
+
+    It 'Diff not last fails to load' {
+        $body = "  - name: Diff`n    entry: none`n    cadence: every`n    order: 5`n  - name: B`n    entry: none`n    cadence: every`n    order: 6"
+        { Get-FrameworkManifest (Write-Getters 'diff-first' $body) } | Should -Throw '*Diff must be last*'
+    }
+}
+
+Describe 'Heartbeat' {
+    BeforeAll {
+        $pester = [string](Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Requirements.pester
+        function New-CommittedFolder {
+            param([string]$Path, [hashtable]$Files)
+            foreach ($k in $Files.Keys) {
+                $file = Join-Path $Path $k
+                $null = New-Item -ItemType Directory -Path (Split-Path $file) -Force
+                Set-Content -LiteralPath $file -Value $Files[$k]
+            }
+            G $Path init --quiet --initial-branch=main | Out-Null
+            G $Path add -A | Out-Null
+            G $Path commit --quiet -m fixture | Out-Null
+            (& git -C $Path rev-parse HEAD)
+        }
+        # A test run to reuse, the way Test leaves one: summary.json and a record per child.
+        function New-FakeTestRun {
+            param([string]$Root, [string]$Stamp, [switch]$NoSummary)
+            $run = Join-Path $Root '.framework' 'test-runs' $Stamp
+            $null = New-Item -ItemType Directory -Path $run -Force
+            if (-not $NoSummary) {
+                Set-Content -LiteralPath (Join-Path $run 'summary.json') -Value '[{"Name":"Kid","Result":"no build script","Verify":"not applicable"}]'
+            }
+            $run
+        }
+
+        $hbRepos = Join-Path $RunRoot 'hb-repos'
+        $goodHead = New-CommittedFolder (Join-Path $hbRepos 'getters' 'Good') @{
+            'tools/Write-Out.ps1'  = 'param($Out) Set-Content -LiteralPath (Join-Path $Out "out.txt") -Value "good"; exit 0'
+            'tests/Good.Tests.ps1' = "Describe 'good' { It 'passes' { 1 | Should -Be 1 } }"
+        }
+        $null = New-CommittedFolder (Join-Path $hbRepos 'getters' 'Bad') @{ 'tools/Fail.ps1' = 'param($Out) "bad getter ran"; exit 1' }
+        $null = New-CommittedFolder (Join-Path $hbRepos 'getters' 'Diff') @{
+            'tools/Compare.ps1' = 'param($Out, $Previous) $p = if ($Previous) { Split-Path $Previous -Leaf } else { "none" }; Set-Content -LiteralPath (Join-Path $Out "verdict.txt") -Value "previous: $p"'
+        }
+        $hbYaml = Join-Path $RunRoot 'fixture-heartbeat.yaml'
+        Set-Content -LiteralPath $hbYaml -Value @"
+requirements:
+  pester: '$pester'
+children:
+  - name: Kid
+    url: https://example.invalid/Kid.git
+    default_branch: main
+    build_script: false
+getters:
+  - name: Good
+    path: getters/Good
+    entry:
+      script: tools/Write-Out.ps1
+      parameters:
+        Out: '{out}'
+    tests: true
+    cadence: every
+    order: 1
+  - name: Bad
+    path: getters/Bad
+    entry:
+      script: tools/Fail.ps1
+      parameters:
+        Out: '{out}'
+    cadence: every
+    order: 2
+  - name: Later
+    entry: none
+    cadence: every
+    order: 3
+    note: not promoted to repos/ yet
+  - name: Diff
+    path: getters/Diff
+    entry:
+      script: tools/Compare.ps1
+      parameters:
+        Out: '{out}'
+        Previous: '{previous}'
+    cadence: every
+    order: 9
+"@
+        $hbManifest = Get-FrameworkManifest $hbYaml
+
+        $hbFramework = Join-Path $RunRoot 'hb-framework'
+        $gradedHead = New-CommittedFolder $hbFramework @{ 'README.md' = 'fixture framework'; '.gitignore' = '.framework/' }
+        $reused = New-FakeTestRun $hbFramework '20260101-000000-001'
+        # Newer, but no summary.json (a standalone tests/ run leaves such folders); -SkipUp must pass over it.
+        $null = New-FakeTestRun $hbFramework '20260101-000000-002' -NoSummary
+
+        $first = Invoke-FrameworkHeartbeat -Manifest $hbManifest -ReposRoot $hbRepos -FrameworkRoot $hbFramework -SkipUp
+        $second = Invoke-FrameworkHeartbeat -Manifest $hbManifest -ReposRoot $hbRepos -FrameworkRoot $hbFramework -SkipUp
+        $by = @{}; $first.Getters | ForEach-Object { $by[$_.Name] = $_ }
+    }
+
+    It 'the pass row and the fail row both appear, and the fail does not stop the run' {
+        $first.Getters.Name | Should -Be @('Good', 'Bad', 'Later', 'Diff')
+        $by['Good'].Result | Should -Be 'pass'
+        $by['Bad'].Result | Should -Be 'fail'
+        $by['Bad'].Note | Should -Match 'entry exit 1'
+        $by['Diff'].Result | Should -Be 'pass'
+        Join-Path $first.Folder 'Good' 'out.txt' | Should -Exist
+        Get-Content (Join-Path $first.Folder 'Bad.log') | Should -Contain 'bad getter ran'
+    }
+
+    It 'a failing getter makes the heartbeat fail' {
+        $first.Failures | Should -Be @('getter Bad')
+        (Get-Content (Join-Path $first.Folder 'heartbeat.json') -Raw | ConvertFrom-Json).failures | Should -Be @('getter Bad')
+    }
+
+    It 'runs the getter''s Pester when tests: true, with JUnit under its folder' {
+        $by['Good'].Passed, $by['Good'].Failed | Should -Be @(1, 0)
+        Join-Path $first.Folder 'Good' 'Good.junit.xml' | Should -Exist
+    }
+
+    It 'result.json carries the getter commit, the graded commit, tested_at and the entry line' {
+        $raw = Get-Content -LiteralPath (Join-Path $first.Folder 'Good.result.json') -Raw
+        $rec = $raw | ConvertFrom-Json
+        $rec.getter_commit | Should -Be $goodHead
+        $rec.graded_commit | Should -Be $gradedHead
+        $rec.getter_dirty | Should -BeFalse
+        $rec.result | Should -Be 'pass'
+        $raw | Should -Match '"tested_at":\s*"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d"'
+        $rec.entry_line | Should -Be "& ./tools/Write-Out.ps1 -Out '$(Join-Path $first.Folder 'Good')'"
+        $by['Good'].GetterCommit | Should -Be $goodHead.Substring(0, 7)
+        $by['Good'].GradedCommit | Should -Be $gradedHead.Substring(0, 7)
+    }
+
+    It 'entry: none is listed as not runnable with its note' {
+        $by['Later'].Result | Should -Be 'not runnable'
+        $by['Later'].Note | Should -Be 'entry: none; not promoted to repos/ yet'
+        Join-Path $first.Folder 'Later.log' | Should -Not -Exist
+        Join-Path $first.Folder 'Later' | Should -Not -Exist
+    }
+
+    It 'entry: none spawns no pwsh' {
+        Mock -ModuleName Framework.Build Invoke-ChildProcess { 0 }
+        $r = Invoke-FrameworkHeartbeat -Manifest $hbManifest -ReposRoot $hbRepos -FrameworkRoot $hbFramework -Only Later
+        ($r.Getters | Where-Object Name -eq 'Later').Result | Should -Be 'not runnable'
+        @($r.Getters | Where-Object Name -ne 'Later').Result | Should -Be @('skipped', 'skipped', 'skipped')
+        Should -Invoke -ModuleName Framework.Build Invoke-ChildProcess -Times 0 -Exactly
+    }
+
+    It '-SkipUp reuses the newest test run that has a summary, and the record says reused' {
+        $first.TestRun.folder | Should -Be '20260101-000000-001'
+        $first.TestRun.reused | Should -BeTrue
+        $rec = Get-Content (Join-Path $first.Folder 'heartbeat.json') -Raw | ConvertFrom-Json
+        $rec.test_run.reused | Should -BeTrue
+        $rec.test_run.reason | Should -Be '-SkipUp'
+        $rec.test_run.folder | Should -Be '20260101-000000-001'
+        $rec.framework.commit | Should -Be $gradedHead
+        $rec.children[0].name | Should -Be 'Kid'
+        @(Get-ChildItem (Join-Path $hbFramework '.framework' 'test-runs') -Directory).Count | Should -Be 2
+    }
+
+    It 'Diff runs last against the previous heartbeat folder' {
+        $first.Diff | Should -Be 'previous: none'
+        $second.Diff | Should -Be "previous: $($first.Stamp)"
+        (Get-Content (Join-Path $second.Folder 'heartbeat.json') -Raw | ConvertFrom-Json).diff | Should -Be "previous: $($first.Stamp)"
+    }
+
+    It 'keeps the newest 5 heartbeat folders' {
+        $root = Join-Path $RunRoot 'hb-retention'
+        $null = New-FakeTestRun $root '20260101-000000-001'
+        foreach ($i in 1..6) { $null = New-Item -ItemType Directory -Path (Join-Path $root '.framework' 'heartbeats' "20200101-000000-00$i") -Force }
+        $r = Invoke-FrameworkHeartbeat -Manifest $hbManifest -ReposRoot $hbRepos -FrameworkRoot $root -Only Later
+        $left = @(Get-ChildItem (Join-Path $root '.framework' 'heartbeats') -Directory).Name | Sort-Object
+        $left.Count | Should -Be 5
+        $left | Should -Contain $r.Stamp
+        $left | Should -Not -Contain '20200101-000000-002'
+    }
+}
+
+Describe 'Verify moves to heartbeat cadence' {
+    BeforeAll {
+        $pester = [string](Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Requirements.pester
+        $vRepos = Join-Path $RunRoot 'children-verify'
+        $vChild = Join-Path $vRepos 'Verified'
+        $null = New-Item -ItemType Directory -Path (Join-Path $vChild 'tests'), (Join-Path $vChild 'tools') -Force
+        Set-Content -LiteralPath (Join-Path $vChild 'Verified.build.ps1') -Value @'
+task Test {
+    $config = New-PesterConfiguration
+    $config.Run.Path = Join-Path $BuildRoot 'tests'
+    $config.Run.PassThru = $true
+    $r = Invoke-Pester -Configuration $config
+    if ($r.FailedCount) { throw "$($r.FailedCount) failed" }
+}
+'@
+        Set-Content -LiteralPath (Join-Path $vChild 'tests' 'Verified.Tests.ps1') -Value "Describe 'fixture' { It 'passes' { 1 | Should -Be 1 } }"
+        Set-Content -LiteralPath (Join-Path $vChild 'tools' 'Verify.ps1') -Value 'param($Plugin) [pscustomobject]@{ Plugin = $Plugin; Reproduces = $true }'
+        G $vChild init --quiet --initial-branch=main | Out-Null
+        G $vChild add -A | Out-Null
+        G $vChild commit --quiet -m fixture | Out-Null
+        $vYaml = Join-Path $RunRoot 'fixture-verify.yaml'
+        Set-Content -LiteralPath $vYaml -Value "requirements:`n  pester: '$pester'`nchildren:`n  - name: Verified`n    url: u`n    default_branch: main`n    build_script: true`n    result_file: preference`n    verify:`n      script: tools/Verify.ps1`n      plugins: [One]"
+        $vManifest = Get-FrameworkManifest $vYaml
+        function Get-NewestRecord { param([string]$Root) $run = @(Get-ChildItem (Join-Path $Root '.framework' 'test-runs') -Directory | Sort-Object Name -Descending)[0].FullName; Join-Path $run 'Verified.result.json' }
+    }
+
+    It 'the plan for Claude.Ontology says heartbeat without -Verify and run with it' {
+        $manifest = Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')
+        $plain = @{}; Get-FrameworkTestPlan -Manifest $manifest | ForEach-Object { $plain[$_.Name] = $_.Verify }
+        $forced = @{}; Get-FrameworkTestPlan -Manifest $manifest -Verify | ForEach-Object { $forced[$_.Name] = $_.Verify }
+        $plain['Claude.Ontology'] | Should -Be 'heartbeat'
+        $forced['Claude.Ontology'] | Should -Be 'run'
+        foreach ($n in 'Claude.Chain', 'Claude.Portal', 'Claude.Root', 'Claude.Framework') {
+            $plain[$n] | Should -Be 'not applicable'
+            $forced[$n] | Should -Be 'not applicable'
+        }
+    }
+
+    It 'without -Verify the column says heartbeat and the record says verify: skipped' {
+        $root = Join-Path $RunRoot 'framework-root-verify-skip'
+        $row = @(Invoke-FrameworkTest -Manifest $vManifest -ReposRoot $vRepos -FrameworkRoot $root -Only Verified)[0]
+        $row.Verify | Should -Be 'heartbeat'
+        $rec = Get-Content -LiteralPath (Get-NewestRecord $root) -Raw | ConvertFrom-Json
+        $rec.verify | Should -Be 'skipped'
+        $rec.verify_outcome | Should -BeNullOrEmpty
+    }
+
+    It 'with -Verify it runs and the record says verify: ran with its outcome' {
+        $root = Join-Path $RunRoot 'framework-root-verify-run'
+        $row = @(Invoke-FrameworkTest -Manifest $vManifest -ReposRoot $vRepos -FrameworkRoot $root -Only Verified -Verify)[0]
+        $row.Verify | Should -Be 'reproduces'
+        $rec = Get-Content -LiteralPath (Get-NewestRecord $root) -Raw | ConvertFrom-Json
+        $rec.verify | Should -Be 'ran'
+        $rec.verify_outcome | Should -Be 'reproduces'
+    }
+
+    It 'Heartbeat runs the verify after Test and marks the child''s record ran, leaving tested_at as written' {
+        $root = Join-Path $RunRoot 'framework-root-verify-skip'
+        $file = Get-NewestRecord $root
+        $before = [regex]::Match((Get-Content -LiteralPath $file -Raw), '"tested_at":\s*"[^"]+"').Value
+        $hb = Invoke-FrameworkHeartbeat -Manifest $vManifest -ReposRoot $vRepos -FrameworkRoot $root -SkipUp
+        $hb.VerifyRows[0].Verify | Should -Be 'reproduces'
+        $hb.Failures | Should -BeNullOrEmpty
+        Join-Path $hb.Folder 'verify' 'Verified.verify-One.json' | Should -Exist
+        $raw = Get-Content -LiteralPath $file -Raw
+        $raw | Should -Match ([regex]::Escape($before))
+        $rec = $raw | ConvertFrom-Json
+        $rec.verify | Should -Be 'ran'
+        $rec.verify_outcome | Should -Be 'reproduces'
+        $rec.verify_by | Should -Be "heartbeat $($hb.Stamp)"
+        (Get-Content (Join-Path $hb.Folder 'heartbeat.json') -Raw | ConvertFrom-Json).children[0].verify | Should -Be 'ran'
+    }
+}
+
 Describe 'Test runs each child in its own process' {
     BeforeAll {
         $pester = [string](Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Requirements.pester

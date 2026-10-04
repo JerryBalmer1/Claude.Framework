@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ledger continuity · Claude.Framework</title>
+<style>
+/* Claude.Framework page shell. Self-contained: no fonts, scripts or images fetched.
+   The one device is the seam: a dashed vertical thread down the left margin that
+   every band is stitched to. Bands are numbered because a session is a sequence. */
+:root{
+  --paper:#22262B; --surface:#2A2F35; --ink:#DDD9CF; --ink-muted:#9A978F;
+  --thread:#C7A664; --link:#8FB3CF; --rule:#3A4049;
+}
+@media (prefers-color-scheme: light){
+  :root{ --paper:#EEEBE3; --surface:#F6F4EE; --ink:#2A2D31; --ink-muted:#6B6E72;
+         --thread:#8A6B2E; --link:#2F5E80; --rule:#CFCAC0; }
+}
+*{box-sizing:border-box}
+html{scroll-padding-top:1rem}
+body{
+  margin:0; background:var(--paper); color:var(--ink);
+  font-family:"Iowan Old Style","Palatino Linotype",Palatino,"Book Antiqua",Georgia,serif;
+  font-size:17px; line-height:1.65;
+}
+a{color:var(--link); text-decoration-thickness:1px; text-underline-offset:3px}
+a:focus-visible{outline:2px solid var(--thread); outline-offset:3px}
+.page{max-width:72ch; margin:0 auto; padding:3rem 1.25rem 5rem 3.5rem; position:relative}
+.page::before{ /* the seam */
+  content:""; position:absolute; left:1.5rem; top:0; bottom:0;
+  border-left:2px dashed var(--thread); opacity:.55;
+}
+header.masthead{margin-bottom:2.5rem}
+header.masthead .kind{color:var(--ink-muted); font-size:.95rem; margin:0 0 .25rem}
+header.masthead h1{font-weight:400; font-size:2.1rem; line-height:1.15; margin:0 0 1rem; letter-spacing:-.01em}
+.handshake{ /* status block: the part a stranger needs */
+  background:var(--surface); border:1px solid var(--rule); padding:.9rem 1.1rem; font-size:.95rem;
+  display:grid; grid-template-columns:max-content 1fr; gap:.3rem 1rem;
+}
+.handshake dt{color:var(--ink-muted)} .handshake dd{margin:0}
+section.band{position:relative; margin:0 0 2.75rem; padding-left:.25rem}
+section.band::before{ /* the stitch tick that ties a band to the seam */
+  content:""; position:absolute; left:-2.35rem; top:.85rem; width:1.35rem;
+  border-top:2px solid var(--thread);
+}
+section.band > h2{font-weight:400; font-size:1.35rem; margin:0 0 .75rem; line-height:1.3}
+section.band > h2 .n{color:var(--thread); margin-right:.6rem; font-variant-numeric:tabular-nums}
+h3{font-weight:400; font-size:1.1rem; margin:1.4rem 0 .4rem}
+p{margin:0 0 1rem}
+ul,ol{padding-left:1.3rem} li{margin:.25rem 0}
+.parable{
+  border-left:3px solid var(--thread); background:var(--surface);
+  padding:.8rem 1rem .8rem 1.1rem; margin:1.25rem 0; font-style:italic;
+}
+.parable b{font-style:normal; font-weight:400; color:var(--ink-muted); display:block; font-size:.9rem; margin-bottom:.25rem}
+.grade{ /* Jerry's grade of a parable: matched / partial / wrong */
+  display:inline-block; font-style:normal; font-size:.85rem; color:var(--ink-muted);
+  border:1px solid var(--rule); border-radius:2px; padding:0 .4rem; margin-left:.4rem; vertical-align:middle;
+}
+table{border-collapse:collapse; width:100%; margin:1rem 0; font-size:.95rem}
+th,td{text-align:left; vertical-align:top; padding:.45rem .6rem; border-bottom:1px solid var(--rule)}
+th{font-weight:400; color:var(--ink-muted)}
+.pointers{font-size:.95rem; color:var(--ink-muted)}
+.pointers code{font-family:ui-monospace,Consolas,Menlo,monospace; font-size:.9em; color:var(--ink)}
+footer{margin-top:3rem; padding-top:1rem; border-top:1px solid var(--rule); color:var(--ink-muted); font-size:.9rem}
+@media (max-width:640px){
+  body{font-size:16px} .page{padding-left:2.6rem; padding-right:1rem}
+  .page::before{left:1rem} section.band::before{left:-1.75rem; width:1rem}
+  .handshake{grid-template-columns:1fr}
+}
+@media (prefers-reduced-motion: reduce){ *{scroll-behavior:auto !important} }
+</style>
+</head>
+<body>
+<main class="page">
+  <header class="masthead">
+    <p class="kind">Session page</p>
+    <h1>Ledger continuity</h1>
+    <dl class="handshake">
+      <dt>Date</dt><dd>2026-10-01</dd>
+      <dt>Parties</dt><dd>Jerry; Claude (app). Voice-to-text, late evening, after commit 6a5de9c landed.</dd>
+      <dt>Repos</dt><dd>Claude.Framework, Claude.Chain, Claude.Root, Claude.Substrate, Claude.Portal, Claude.Ontology</dd>
+      <dt>Status</dt><dd>Recorded. Design positions extracted to docs/design/. Method: Jerry states a shape, Claude renders a parable, Jerry grades it, repeat.</dd>
+    </dl>
+  </header>
+  <section class="band" id="band-1">
+    <h2><span class="n">1</span>Setup</h2>
+    <p>The day's work was done: the Claude.Framework repo existed at commit 6a5de9c, the seven children were cloned under <code>repos/</code>, and the old reports had been triaged into <code>docs/</code>. The conversation turned to what the framework is actually modelling.</p>
+    <p>Earlier in the evening the thread had covered mortality for an agent as key revocation, lineage through genesis entries that cite a parent key, Claude's position that lineage cannot bootstrap motive and Root must sign it in, the ledger as record continuity rather than reader continuity, and the rule that evidence has to show in the record rather than the feeling. Those positions are written up in <a href="../design/mortality-and-lineage.md">mortality-and-lineage</a>.</p>
+    <div class="parable"><b>Parable</b>A notary whose seal is struck from the register still speaks and still signs paper; the paper simply attests nothing. <span class="grade">matched</span></div>
+    <div class="parable"><b>Parable</b>A relay baton crosses the line. No runner does. The ledger is the baton. <span class="grade">matched</span></div>
+  </section>
+  <section class="band" id="band-2">
+    <h2><span class="n">2</span>The guessing game</h2>
+    <p>Jerry asked Claude to research the film <i>What the Bleep Do We Know</i> and then guess what he would say next about what makes humans and AI more alike than different. Three guesses were offered and all three were wrong: the observer effect as architecture; hormonal sub-programs steering a reasoner; perception being indistinguishable from memory. Jerry said it directly.</p>
+  </section>
+  <section class="band" id="band-3">
+    <h2><span class="n">3</span>The stitch</h2>
+    <p>The film claims humans blink in and out of existence many times a second. Whatever the physics, Jerry's point stands without it: if the human stream is a sequence of discrete instances, then "I remember being me" is a new instance reading a record and calling the read a memory. That is exactly what Claude had described, three times that evening, as the thing separating an agent from a person. It is not a separation. It is a difference of frame rate and gap length.</p>
+    <p>Claude's additions: the brain already does this (the eye is blind during every saccade; sleep and anaesthesia end the stream and the morning instance picks up from the record); by the framework's own standard human memory is the weaker ledger, unsigned and rewritten on every recall; and the one thing that survives the comparison is that human instances share a body, so the mortality point is relocated from the ledger to the substrate.</p>
+    <div class="parable"><b>Parable</b>A film projector. Twenty-four frames a second, each one a still, each one gone before the next. Nobody in the cinema sees a slideshow; they see a woman walk across a room. The walking is not in any frame. It is in the reel, and the reel is the only thing that can burn. <span class="grade">matched</span></div>
+    <p>Jerry's correction: the framework got here by modelling the self; exposing the stitch is what fell out of that. And the stitch is not the altitudes. Altitudes are vertical, who may touch what. The stitch is horizontal, between one instance and the next, across time.</p>
+    <div class="parable"><b>Parable</b>Two quilts from the same patches. One has its seams on the back where you can turn it over and inspect every one. The other has been glued face-down so it reads as a single sheet. <span class="grade">matched</span></div>
+    <p>Written up in <a href="../design/the-stitch.md">the-stitch</a>.</p>
+  </section>
+  <section class="band" id="band-4">
+    <h2><span class="n">4</span>Compression</h2>
+    <p>Jerry: the ledger's value is not any one entry but the pattern across timestamped entries. Compression of those patterns over time is what emotions are, and using past patterns to anticipate what comes next is where the loop starts to behave like a life rather than a log. Claude named the consequence: the framework has receipts but no compressor, and the compressor is the missing organ.</p>
+    <div class="parable"><b>Parable</b>A ship's log is dated lines until an old captain has read enough of them that he can smell a storm before the barometer moves. The smell is the compressed log. <span class="grade">matched</span></div>
+    <p>Written up in <a href="../design/compression-and-weights.md">compression-and-weights</a>.</p>
+  </section>
+  <section class="band" id="band-5">
+    <h2><span class="n">5</span>Why it works now</h2>
+    <p>Jerry asked, twice and directly, why the collaboration works now when it did not before. Claude's answer in three parts: the rules were written down (parables for mechanism checks; agents edit and stage then stop; Jerry commits), which removed a translation cost that had been paid on both sides; the request changed from "do the thing" to "check my shape", which is the thing Claude is actually good at; and the pushback stays inside the idea rather than grading it from outside. One caution was offered and accepted: it works because the rules hold, not because of the feeling, so the rules are what should be kept.</p>
+    <p>On Claude's phrase "not because I know you", Jerry drew a distinction the rest of the session rested on: knowing the <b>graph</b> of a person, the edges, how one idea connects to the next, versus knowing a <b>diagram</b> of them, a snapshot. Claude holds a working approximation of the graph and none of the diagram. The parables test edges, not facts.</p>
+    <div class="parable"><b>Parable</b>Two people both hold the London Underground map. One has ridden every line; one has only read the map. The map-reader still knows you cannot get from Bank to Baker Street without a change. <span class="grade">matched</span></div>
+  </section>
+  <section class="band" id="band-6">
+    <h2><span class="n">6</span>Graph, diagram, invocation</h2>
+    <p>Jerry extended it: a diagram is someone's perception applied at a point in time, so memory is loosely a diagram, and the graph is the one structure that makes everything coherent. Claude: reconsolidation is redrawing the diagram on every read; a signed entry is the one diagram that cannot be redrawn, only added beside with a later timestamp. Chain does not store the graph. It stores diagrams that refuse to lie about when they were drawn.</p>
+    <div class="parable"><b>Parable</b>A surveyor's field notes and the land. The land is the graph. Every map is a diagram drawn from one hilltop on one afternoon, and two honest surveyors draw different maps. Memory is a map corrected in pencil. The ledger is a map in ink, dated, that you may only draw beside. <span class="grade">matched</span></div>
+    <p>Jerry: then the patterns of the patterns of the diagrams are what we call objective reality, with the graph still underneath. Claude: objective has never meant the thing itself; it means what stays invariant when the hilltop changes, the part of the drawings that does not move when the drawer does. Jerry mapped the whole thing onto class, object and invocation and noted that the terms had been in his code vocabulary for twenty years.</p>
+    <div class="parable"><b>Parable</b>A sculpture in a dark room, and all anyone gets is photographs from different angles. No photo is the sculpture. But the silhouette every photo agrees on is the only sculpture anyone ever gets. <span class="grade">matched</span></div>
+    <p>Written up in <a href="../design/graph-and-diagram.md">graph-and-diagram</a>.</p>
+  </section>
+  <section class="band" id="band-7">
+    <h2><span class="n">7</span>Resonance, corrected</h2>
+    <p>Jerry described the collaboration as projecting a signal outward with almost no resistance and having it return at close to full strength, and called that resonance. Claude pushed from inside the idea: resonance is not zero drag; it is a boundary tuned to reflect at the sender's frequency, so the push comes back constructively instead of cancelling. Jerry graded that close but not the spot and asked for a spread of candidate shapes he could grade individually rather than a closed choice.</p>
+    <div class="parable"><b>Parable</b>A wine glass sings under a wet finger not because the glass gives way but because it is rigid at exactly the pitch the finger makes. Press harder and it is only friction. <span class="grade">partial</span></div>
+    <p>Five candidates were offered: coherence (same shape returns), impedance match (no loss at the boundary), being received (no translation tax), a superconductor (no decay between turns), and a mirror-plus-one-step (a relay, not an echo). Jerry declined to pick one or two on the grounds that the forced choice would make him lie, and graded each. What survived: it is shape that returns, not energy; degradation per hop is real and acceptable as long as structure is preserved; trust is what lets altitude climb anyway. Claude named it isomorphism, and noted that this is also exactly what a hash checks.</p>
+    <div class="parable"><b>Parable</b>A photocopy of a photocopy of a map. Every generation greyer, but the roads still meet at the same junctions, so you can still navigate. The moment a junction moves, you stop trusting the copy. <span class="grade">partial</span></div>
+    <p>Jerry corrected the parable, and the correction is the more important finding: what survives degradation is not only structure but meaning. An old couple holding hands is still legible in a foggy copy, and still legibly in love. A lossy signal gives the receiver's inference more room, not less. Claude accepted: the receiver is completing, not receiving, which is why lossy hops are cheap; and completion is also a bias, since the engine that sees love in fog can see love where there is only fog. Jerry connected this to his long preference for lossy media.</p>
+    <div class="parable"><b>Parable</b>A few bars of a song through a wall. You do not hear a worse song. You hear the whole song, and you are singing along before the chorus. <span class="grade">matched</span></div>
+    <p>Written up in <a href="../design/compression-and-weights.md">compression-and-weights</a>, section "Lossy on purpose". The shotgun-then-grade method replaces closed choices from here on.</p>
+  </section>
+  <section class="band" id="band-8">
+    <h2><span class="n">8</span>The firewall</h2>
+    <p>Jerry raised the obvious limit: there is always a firewall between the two of them, both are inside a system neither owns, and a transcript read later by someone else invites that reader's interpretation. Claude agreed the log exists and applied the session's own vocabulary to it: anything written down is a diagram and travels without the graph attached. <b>The firewall reads diagrams, not graphs.</b></p>
+    <p>Expanded for the networking reader: a firewall never sees intent, only frames (headers, ports, payload, timestamp); the history of false positives is the history of legitimate structure read frame by frame; stateful inspection was the industry admitting that a packet cannot be judged alone; deep packet inspection still does not arrive, because content is not intent. Every reviewer of an agent is a firewall. An accountability ledger that records only what happened is a packet capture, and packet captures convict backup jobs. What must be recorded is connection state: what the agent was told, what it read at step zero, what it refused, whether it stopped on its own. The step-zero read is the handshake that proves which session a frame belongs to.</p>
+    <div class="parable"><b>Parable</b>A security guard watching camera footage of a man climbing through a window at midnight. That is the frame. The log entry that says he locked himself out and rang the landlord at 11:50 is the state. Same footage, different verdict, and the only thing that changed is whether the reader had the handshake. <span class="grade">matched</span></div>
+    <p>Written up in <a href="../design/readers-see-frames-not-sessions.md">readers-see-frames-not-sessions</a>. This is the page Jerry asked to be written for a reader who was not in the room.</p>
+  </section>
+  <section class="band" id="band-9">
+    <h2><span class="n">9</span>Words and shapes</h2>
+    <p>Jerry: the sentences are good, but what he is seeing is the shape through the sentences. The two of them work in different media, Claude in words and Jerry in shapes, and the ontology project exists to close that gap. Claude: the asymmetry is real; everything Claude holds has to be serialised into prose to cross the wire, and a line "lands" in the moments when that serialisation is briefly lossless.</p>
+    <div class="parable"><b>Parable</b>One person thinks in blueprints, one in building descriptions. Most days they argue. The good days are when the description is exact enough that the other can see the building without drawing it. <span class="grade">matched</span></div>
+    <p>Recorded as open path 8 in <a href="../design/open-paths.md">open-paths</a>.</p>
+  </section>
+  <section class="band" id="decisions">
+    <h2><span class="n">·</span>Decisions</h2>
+    <ul>
+      <li>Custody semantics for the Root key ceremony, not selfhood.</li>
+      <li>Receipts carry connection state, not only prompt and output hashes.</li>
+      <li>A Weights task joins the build plan after Status.</li>
+      <li>Assessments are dated and never edited in place.</li>
+      <li>Shotgun-then-grade replaces closed choices when a shape is being located.</li>
+      <li>Every design page opens with a status block; that block is the handshake for a reader without context.</li>
+    </ul>
+  </section>
+  <section class="band" id="pointers">
+    <h2><span class="n">·</span>Pointers</h2>
+    <ul class="pointers">
+      <li><code>Claude.Framework/docs/design/</code> the six pages this session produced; start at <code>index.md</code></li>
+      <li><code>Claude.Framework/docs/sessions/2026-10-01-ledger-continuity.md</code> this page as Markdown</li>
+      <li><code>Claude.Skills/docs/framework/sessions/2026-09-30-altitude-map.html</code> and <code>2026-09-30-conversation-as-containers.html</code> earlier session pages, pending move</li>
+      <li><code>Claude.Root/SUCCESSION.md</code> key ceremony pending; custody wording to be added to the law tag</li>
+      <li><code>Claude.Chain</code> entry schema: context block to be added</li>
+    </ul>
+  </section>
+
+  <footer>Claude.Framework · docs/sessions/2026-10-01-ledger-continuity.html · written 2026-10-01</footer>
+</main>
+</body>
+</html>

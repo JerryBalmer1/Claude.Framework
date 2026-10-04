@@ -6,7 +6,7 @@
 #   expect.full_test_task     the task Test -Full and Up -Full run instead, where declared
 #   expect.expected_failures  known failing tests; up to this many is pass-with-known, more is FAIL (needs reason)
 #   expect.no_tests           true when the child has no *.Tests.ps1 files; reported as no-tests (needs reason)
-#   verify                    a script under the child, run once per plugin after Test
+#   verify                    a script under the child, run once per plugin by Heartbeat (or Test/Up -Verify)
 # Required when build_script is true:
 #   result_file               how Test gets a result file: parameter (the build takes -PesterConfiguration,
 #                             TestResult only), preference (the child's Invoke-Pester merges $PesterPreference),
@@ -69,3 +69,58 @@ children:
     result_file: preference
     expect:
       tasks_before_test: [Install]
+
+# Getters Heartbeat runs headlessly, each in its own fresh pwsh rooted in its path, by order. CLAUDE.md: a getter runs
+# only from a path under repos/, never from elsewhere on disk.
+# Required: name, order (whole number, unique; Diff must be last), cadence (every | weekly), entry.
+#   entry       none (registered, not runnable yet; Heartbeat lists it as not runnable), or
+#               script: a .ps1 under tools/ in the getter's path, parameters: name: value, where a value may hold
+#               {out} (this getter's folder under .framework/heartbeats/<stamp>/), {previous} (the previous
+#               heartbeat folder), {framework_root} and {repos_root}
+#   path        relative to repos/; required unless entry is none
+# Optional: tests (true runs the getter's Pester, JUnit under its output folder), expects (expected_failures or
+# no_tests, each with reason), note.
+# None of the six is under repos/ yet, so each is entry: none with no path until it is promoted.
+
+getters:
+  - name: Catalogue
+    entry: none
+    tests: false
+    cadence: every
+    order: 10
+    note: not promoted to repos/ yet
+
+  - name: Hardening
+    entry: none
+    tests: false
+    cadence: every
+    order: 20
+    note: not promoted to repos/ yet
+
+  - name: Incidents
+    entry: none
+    tests: false
+    cadence: every
+    order: 30
+    note: not promoted to repos/ yet
+
+  - name: Shape
+    entry: none
+    tests: false
+    cadence: every
+    order: 40
+    note: not promoted to repos/ yet
+
+  - name: Secrets
+    entry: none
+    tests: false
+    cadence: every
+    order: 50
+    note: not promoted to repos/ yet
+
+  - name: Diff
+    entry: none
+    tests: false
+    cadence: every
+    order: 90
+    note: not promoted to repos/ yet

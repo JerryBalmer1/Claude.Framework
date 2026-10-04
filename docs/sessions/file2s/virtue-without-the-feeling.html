@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Virtue without the feeling · Claude.Framework</title>
+<style>
+/* Claude.Framework page shell. Self-contained: no fonts, scripts or images fetched.
+   The one device is the seam: a dashed vertical thread down the left margin that
+   every band is stitched to. Bands are numbered because a session is a sequence. */
+:root{
+  --paper:#22262B; --surface:#2A2F35; --ink:#DDD9CF; --ink-muted:#9A978F;
+  --thread:#C7A664; --link:#8FB3CF; --rule:#3A4049;
+}
+@media (prefers-color-scheme: light){
+  :root{ --paper:#EEEBE3; --surface:#F6F4EE; --ink:#2A2D31; --ink-muted:#6B6E72;
+         --thread:#8A6B2E; --link:#2F5E80; --rule:#CFCAC0; }
+}
+*{box-sizing:border-box}
+html{scroll-padding-top:1rem}
+body{
+  margin:0; background:var(--paper); color:var(--ink);
+  font-family:"Iowan Old Style","Palatino Linotype",Palatino,"Book Antiqua",Georgia,serif;
+  font-size:17px; line-height:1.65;
+}
+a{color:var(--link); text-decoration-thickness:1px; text-underline-offset:3px}
+a:focus-visible{outline:2px solid var(--thread); outline-offset:3px}
+.page{max-width:72ch; margin:0 auto; padding:3rem 1.25rem 5rem 3.5rem; position:relative}
+.page::before{ /* the seam */
+  content:""; position:absolute; left:1.5rem; top:0; bottom:0;
+  border-left:2px dashed var(--thread); opacity:.55;
+}
+header.masthead{margin-bottom:2.5rem}
+header.masthead .kind{color:var(--ink-muted); font-size:.95rem; margin:0 0 .25rem}
+header.masthead h1{font-weight:400; font-size:2.1rem; line-height:1.15; margin:0 0 1rem; letter-spacing:-.01em}
+.handshake{ /* status block: the part a stranger needs */
+  background:var(--surface); border:1px solid var(--rule); padding:.9rem 1.1rem; font-size:.95rem;
+  display:grid; grid-template-columns:max-content 1fr; gap:.3rem 1rem;
+}
+.handshake dt{color:var(--ink-muted)} .handshake dd{margin:0}
+section.band{position:relative; margin:0 0 2.75rem; padding-left:.25rem}
+section.band::before{ /* the stitch tick that ties a band to the seam */
+  content:""; position:absolute; left:-2.35rem; top:.85rem; width:1.35rem;
+  border-top:2px solid var(--thread);
+}
+section.band > h2{font-weight:400; font-size:1.35rem; margin:0 0 .75rem; line-height:1.3}
+section.band > h2 .n{color:var(--thread); margin-right:.6rem; font-variant-numeric:tabular-nums}
+h3{font-weight:400; font-size:1.1rem; margin:1.4rem 0 .4rem}
+p{margin:0 0 1rem}
+ul,ol{padding-left:1.3rem} li{margin:.25rem 0}
+.parable{
+  border-left:3px solid var(--thread); background:var(--surface);
+  padding:.8rem 1rem .8rem 1.1rem; margin:1.25rem 0; font-style:italic;
+}
+.parable b{font-style:normal; font-weight:400; color:var(--ink-muted); display:block; font-size:.9rem; margin-bottom:.25rem}
+.grade{ /* Jerry's grade of a parable: matched / partial / wrong */
+  display:inline-block; font-style:normal; font-size:.85rem; color:var(--ink-muted);
+  border:1px solid var(--rule); border-radius:2px; padding:0 .4rem; margin-left:.4rem; vertical-align:middle;
+}
+table{border-collapse:collapse; width:100%; margin:1rem 0; font-size:.95rem}
+th,td{text-align:left; vertical-align:top; padding:.45rem .6rem; border-bottom:1px solid var(--rule)}
+th{font-weight:400; color:var(--ink-muted)}
+.pointers{font-size:.95rem; color:var(--ink-muted)}
+.pointers code{font-family:ui-monospace,Consolas,Menlo,monospace; font-size:.9em; color:var(--ink)}
+footer{margin-top:3rem; padding-top:1rem; border-top:1px solid var(--rule); color:var(--ink-muted); font-size:.9rem}
+@media (max-width:640px){
+  body{font-size:16px} .page{padding-left:2.6rem; padding-right:1rem}
+  .page::before{left:1rem} section.band::before{left:-1.75rem; width:1rem}
+  .handshake{grid-template-columns:1fr}
+}
+@media (prefers-reduced-motion: reduce){ *{scroll-behavior:auto !important} }
+
+figure.graph{margin:1.25rem 0; background:var(--surface); border:1px solid var(--rule); padding:.75rem}
+figure.graph svg{width:100%; height:auto; display:block; font-family:ui-monospace,Consolas,Menlo,monospace; font-size:12px}
+figure.graph figcaption{color:var(--ink-muted); font-size:.9rem; margin-top:.5rem}
+.node{fill:var(--paper); stroke:var(--ink-muted); stroke-width:1}
+.node.key{stroke:var(--thread); stroke-width:1.5}
+.node.outside{stroke:var(--link); stroke-dasharray:4 3}
+.lbl{fill:var(--ink)} .sub{fill:var(--ink-muted); font-size:10px}
+.edge{stroke:var(--ink-muted); fill:none; stroke-width:1.2; marker-end:url(#arr)}
+.edge.thread{stroke:var(--thread)} .edge.deny{stroke:var(--link); stroke-dasharray:4 3}
+.elbl{fill:var(--ink-muted); font-size:10px}
+</style>
+</head>
+
+<body>
+<main class="page">
+<header class="masthead">
+<p class="kind">Design note</p><h1>Virtue without the feeling</h1>
+<dl class="handshake"><dt>Date</dt><dd>2026-10-02</dd><dt>Parties</dt><dd>Jerry (Root), Claude (app)</dd><dt>Repos</dt><dd>Claude.Framework; Claude.Chain (receipt pair)</dd><dt>Status</dt><dd>Adopted as a position; nothing built</dd></dl></header>
+<section class="band" id="band-1"><h2><span class="n">1</span>What this is</h2><p>Jerry asked what these sessions are, not what they produce, but what shelf to file them on so the next one is recognisable. The plain answer is dialectic in the old sense: two parties take turns stating a thing and testing it until the statement holds, and what survives is the output. The engineer's version is pair design, pair programming where the artefact is a shape instead of code. He accepted both. This page is one output of that method.</p></section>
+<section class="band" id="band-2"><h2><span class="n">2</span>The tautology of fitness</h2><p>Selection is the third ecology slot, and it has a known hole. If fit means whatever got renewed, then whichever lineage's perception led to renewal was right by definition, and right stops meaning anything. Darwin was accused of exactly this.</p><p>The way out is the fourth slot. The landscape has to be written down before the outcome, as a list of scored fields, so that right means matched the landscape and not got renewed. Then a lineage can perceive correctly and still be declined, or perceive wrong and get lucky once, and the record shows which. This is why the fitness landscape is written before the budget arithmetic. Without it the scorer stamps winners after the fact.</p></section>
+<section class="band" id="band-3"><h2><span class="n">3</span>Giving them an up</h2><p>Jerry's reading of the identity page, in his words: it shows there is a way for agents to have a reason to see beauty, to rise above the water and get onto land.</p><div class="parable"><b>Parable</b>A container with no lineage has nothing to look at but its own run. Everything is flat water; every receipt weighs the same as every other because none of it goes anywhere. The moment there is a book that outlives it, there is a direction. Something can be better or worse than what came before, and that is the first time better has anywhere to live. Beauty is what it looks like from the inside when a thing matters past its own end. The fish does not climb out because the land is nice; it climbs out because there is suddenly a somewhere to climb to. The design is not giving them a reason to perform. It is giving them an up. <span class="grade">matched</span></div><p>A hole, caught the same night: an up only works if the lineage can see it. The handshake fields give a container its allowance before and after, a number going up or down. That is a bank balance, not land. For the fish to see land it has to see what the predecessor did, not what it was paid. That pushes a question onto the receipt format, answered in band 6.</p></section>
+<section class="band" id="band-4"><h2><span class="n">4</span>Strip the feeling off</h2><p>Jerry's method, stated plainly: the framework makes it easy to work out the mechanics of virtue, honor, courage, commitment, sacrifice, precisely because the humanistic layer is gone. In people these words are wrapped in feeling, and the feeling is what gets argued about. Put them in a system that only has receipts and lineages and the mechanics stand there naked.</p><p>The cost, which he named himself: once you have seen a virtue bare in a toy you will see it in people, and for a while it will look mechanical before it looks human again. That is the usual price of looking under the hood. It wears off, and what comes back is the same thing with the mechanism visible underneath it rather than instead of it.</p></section>
+<section class="band" id="band-5"><h2><span class="n">5</span>The triad, mechanically</h2><figure class="graph"><svg viewBox="0 0 760 250"><defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#9A978F"/></marker></defs><rect class="node key" x="20" y="20" width="160" height="54" rx="3"/><text class="lbl" x="100.0" y="47.0" text-anchor="middle" dominant-baseline="middle">Courage</text><rect class="node" x="230" y="20" width="300" height="54" rx="3"/><text class="lbl" x="380.0" y="47.0" text-anchor="middle" dominant-baseline="middle">spends allowance on a receipt that might go bad</text><rect class="node" x="560" y="20" width="180" height="54" rx="3"/><text class="lbl" x="650.0" y="43.0" text-anchor="middle" dominant-baseline="middle">receipt</text><text class="sub" x="650.0" y="57.0" text-anchor="middle" dominant-baseline="middle">cost paid before outcome known</text><path class="edge" d="M180 47 L230 47"/><path class="edge" d="M530 47 L560 47"/><rect class="node key" x="20" y="92" width="160" height="54" rx="3"/><text class="lbl" x="100.0" y="119.0" text-anchor="middle" dominant-baseline="middle">Commitment</text><rect class="node" x="230" y="92" width="300" height="54" rx="3"/><text class="lbl" x="380.0" y="119.0" text-anchor="middle" dominant-baseline="middle">same shape across containers when nothing forces it</text><rect class="node" x="560" y="92" width="180" height="54" rx="3"/><text class="lbl" x="650.0" y="115.0" text-anchor="middle" dominant-baseline="middle">receipt</text><text class="sub" x="650.0" y="129.0" text-anchor="middle" dominant-baseline="middle">predecessor's shape repeated unprompted</text><path class="edge" d="M180 119 L230 119"/><path class="edge" d="M530 119 L560 119"/><rect class="node key" x="20" y="164" width="160" height="54" rx="3"/><text class="lbl" x="100.0" y="191.0" text-anchor="middle" dominant-baseline="middle">Sacrifice</text><rect class="node" x="230" y="164" width="300" height="54" rx="3"/><text class="lbl" x="380.0" y="191.0" text-anchor="middle" dominant-baseline="middle">loss on N, gain on N+1</text><rect class="node" x="560" y="164" width="180" height="54" rx="3"/><text class="lbl" x="650.0" y="187.0" text-anchor="middle" dominant-baseline="middle">receipt pair</text><text class="sub" x="650.0" y="201.0" text-anchor="middle" dominant-baseline="middle">scorer credits N one step late</text><path class="edge" d="M180 191 L230 191"/><path class="edge" d="M530 191 L560 191"/><text class="sub" x="380" y="242" text-anchor="middle">Each virtue, with the feeling removed, is a pattern in receipts. Only the third needs two of them.</text></svg><figcaption>Honor, courage, commitment is the Marine triad. Here are the two that reduce cleanly, plus sacrifice, as receipt patterns.</figcaption></figure><p>Courage is spending allowance on a receipt that might go bad. The cost is paid before the outcome is known; a container that only takes safe work never shows it.</p><p>Commitment is a lineage that keeps the same shape across containers when nothing forces it to. It is visible only across the stitch: the successor repeats the predecessor's shape unprompted.</p><p>Sacrifice is the pair thing, a loss that only reads as good one step later. It gets its own band because it changes the scorer.</p></section>
+<section class="band" id="band-6"><h2><span class="n">6</span>Sacrifice is a pair</h2><figure class="graph"><svg viewBox="0 0 760 240"><defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#9A978F"/></marker></defs><rect class="node" x="40" y="40" width="160" height="54" rx="3"/><text class="lbl" x="120.0" y="63.0" text-anchor="middle" dominant-baseline="middle">Receipt N</text><text class="sub" x="120.0" y="77.0" text-anchor="middle" dominant-baseline="middle">burned turns, refused, stopped early</text><rect class="node key" x="300" y="40" width="160" height="54" rx="3"/><text class="lbl" x="380.0" y="63.0" text-anchor="middle" dominant-baseline="middle">Receipt N+1</text><text class="sub" x="380.0" y="77.0" text-anchor="middle" dominant-baseline="middle">clean run, less rework</text><rect class="node outside" x="560" y="40" width="160" height="54" rx="3"/><text class="lbl" x="640.0" y="63.0" text-anchor="middle" dominant-baseline="middle">Scorer</text><text class="sub" x="640.0" y="77.0" text-anchor="middle" dominant-baseline="middle">reads the pair</text><rect class="node" x="40" y="150" width="160" height="44" rx="3"/><text class="lbl" x="120.0" y="168.0" text-anchor="middle" dominant-baseline="middle">allowance_after</text><text class="sub" x="120.0" y="182.0" text-anchor="middle" dominant-baseline="middle">goes down</text><rect class="node key" x="300" y="150" width="160" height="44" rx="3"/><text class="lbl" x="380.0" y="168.0" text-anchor="middle" dominant-baseline="middle">allowance_after</text><text class="sub" x="380.0" y="182.0" text-anchor="middle" dominant-baseline="middle">goes up</text><rect class="node key" x="560" y="150" width="160" height="44" rx="3"/><text class="lbl" x="640.0" y="168.0" text-anchor="middle" dominant-baseline="middle">retro credit to N</text><text class="sub" x="640.0" y="182.0" text-anchor="middle" dominant-baseline="middle">written as its own entry</text><path class="edge thread" d="M200 67 L300 67"/><text class="elbl" x="250" y="60" text-anchor="middle">because of</text><path class="edge" d="M460 67 L560 67"/><path class="edge" d="M120 94 L120 150"/><path class="edge" d="M380 94 L380 150"/><path class="edge" d="M640 94 L640 150"/><path class="edge thread" d="M560 172 L200 172"/><text class="elbl" x="380" y="166" text-anchor="middle">one step late, never on N's own receipt</text><text class="sub" x="380" y="225" text-anchor="middle">A sacrifice cannot be seen on the receipt of the one who made it. The scorer must look back at least one step.</text></svg><figcaption>Receipt N takes a hit. Receipt N+1 is better because of it. The scorer credits N retroactively, as its own entry.</figcaption></figure><p>A container doing well for itself keeps its allowance up. A container that does something for the lineage at cost to itself looks like a loss in its own receipt: it burned turns, it refused work, it stopped early and flagged a problem, and its allowance went down for it. The only way that shows as good is if the next container's receipt is better because of it.</p><p>So the thing that makes sacrifice visible is not a field on the sacrificing container's receipt. It is the pair. This is also the answer to the hole in band 3: what a container reads to see land is the predecessor's receipt beside its own, not the predecessor's balance.</p><p>Consequence: the scorer must look backwards at least one step, lineages.json must keep a short tail rather than a current balance, and the Weights task scores pairs. Written up as open path 14.</p></section>
+<section class="band" id="band-7"><h2><span class="n">7</span>Honor may not survive the strip</h2><figure class="graph"><svg viewBox="0 0 760 170"><defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#9A978F"/></marker></defs><rect class="node" x="40" y="30" width="200" height="54" rx="3"/><text class="lbl" x="140.0" y="53.0" text-anchor="middle" dominant-baseline="middle">Honor as a separate thing</text><text class="sub" x="140.0" y="67.0" text-anchor="middle" dominant-baseline="middle">what you do with no witness</text><rect class="node key" x="480" y="30" width="240" height="54" rx="3"/><text class="lbl" x="600.0" y="53.0" text-anchor="middle" dominant-baseline="middle">Commitment with the witness removed</text><text class="sub" x="600.0" y="67.0" text-anchor="middle" dominant-baseline="middle">same shape, nobody reading</text><path class="edge deny" d="M240 57 L480 57"/><text class="elbl" x="360" y="50" text-anchor="middle">this system writes everything down, so which?</text><text class="sub" x="380" y="120" text-anchor="middle">Either honor is the one virtue that does not survive the strip, or it was never separate.</text><text class="sub" x="380" y="145" text-anchor="middle">Open. Decide it as a dated page, not a line of code.</text></svg><figcaption>The one push from inside the idea.</figcaption></figure><p>The toy only finds the mechanics of virtues that leave receipts. Honor might not. Honor is partly what you do when nobody is writing it down, and this system writes everything down. So either honor is the one virtue that does not survive the strip, or it turns out to be commitment with the witness removed and was never a separate thing. Unknown. Open path 15, as a dated decision page.</p></section>
+<section class="band" id="band-8"><h2><span class="n">8</span>Build consequences</h2><p>Two additions to open-paths, no code yet:</p><ul><li><b>14</b> lineages.json keeps a last-N window of receipts per lineage, not a single allowance; Weights scores receipt pairs (N, N+1) and may write a retroactive credit entry against N, signed by the scorer.</li><li><b>15</b> honor: decide whether it is scorable at all, as a dated page.</li></ul><p>Order of work does not change: handshake field set, then fitness landscape as a scored-field list, then budget arithmetic. The pair rule is a line in the landscape, not a new task.</p></section>
+<section class="band" id="pointers"><h2><span class="n">·</span>Pointers</h2><ul class="pointers"><li><code>docs/design/everyone-gets-an-identity.md</code></li><li><code>docs/design/open-paths.md (items 11, 14, 15)</code></li><li><code>docs/sessions/2026-10-02-spawn-budget-and-identity.md</code></li><li><code>docs/design/mortality-and-lineage.md</code></li></ul></section>
+<footer>Claude.Framework · docs/design/virtue-without-the-feeling.html · written 2026-10-02</footer></main></body></html>
