@@ -105,7 +105,8 @@ children:
 # that child is on its expected branch.
 # Each getter ends ok, failed, refused or skipped. Refused is a non-zero exit whose last printed line begins "refused".
 # The verdict line is the first line of {out}/verdict.txt, else the last line the entry printed.
-# Shape, Secrets and Coverage are promoted (Claude.Modules); the others are entry: none with no path until they are.
+# Shape, Secrets, Coverage and Diff are promoted (Claude.Modules); the others are entry: none with no path until they are.
+# Diff is the only getter that reads earlier heartbeats, and it is always last.
 
 getters:
   - name: Catalogue
@@ -167,10 +168,17 @@ getters:
     cadence: every
     order: 60
 
+  # -Before and -After are not passed: -After defaults to {out}\.., the heartbeat Diff runs inside, and -Before to the
+  # newest older heartbeat beside it that holds a heartbeat.json. With none, Diff refuses (a refused outcome, not failed).
   - name: Diff
-    entry: none
+    path: Claude.Modules
+    entry:
+      script: tools/Get-FrameworkDiff.ps1
+      parameters:
+        Root: '{framework_root}'
+        Out: '{out}'
+    outputs: [diff.json, diff.md, verdict.txt]
     needs: [Shape]
     tests: false
     cadence: every
     order: 90
-    note: not promoted to repos/ yet

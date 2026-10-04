@@ -158,10 +158,10 @@ Describe 'framework.yaml getters' {
         $ok = "  - name: A`n    path: getters/A`n    entry:`n      script: tools/Run.ps1`n    cadence: every`n    order: 1"
     }
 
-    It 'registers seven getters, Diff last; all but Shape, Secrets and Coverage are entry: none, no path, not promoted yet' {
+    It 'registers seven getters, Diff last; all but Shape, Secrets, Coverage and Diff are entry: none, no path, not promoted yet' {
         $g = (Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Getters
         $g.Name | Should -Be @('Catalogue', 'Hardening', 'Incidents', 'Shape', 'Secrets', 'Coverage', 'Diff')
-        foreach ($x in @($g | Where-Object Name -notin 'Shape', 'Secrets', 'Coverage')) {
+        foreach ($x in @($g | Where-Object Name -notin 'Shape', 'Secrets', 'Coverage', 'Diff')) {
             $x.Entry | Should -BeNullOrEmpty
             $x.Path | Should -BeNullOrEmpty
             $x.Note | Should -Be 'not promoted to repos/ yet'
@@ -204,6 +204,19 @@ Describe 'framework.yaml getters' {
         $s.Order | Should -Be 40
         $s.Cadence | Should -Be 'every'
         @($s.Needs).Count | Should -Be 0
+    }
+
+    It 'Diff runs Claude.Modules tools/Get-FrameworkDiff.ps1 with -Root and -Out, no -Before or -After, order 90, every, needing Shape' {
+        $s = (Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Getters | Where-Object Name -eq 'Diff'
+        $s.Path | Should -Be 'Claude.Modules'
+        $s.Entry.Script | Should -Be 'tools/Get-FrameworkDiff.ps1'
+        @($s.Entry.Parameters.Keys | Sort-Object) | Should -Be @('Out', 'Root')
+        $s.Entry.Parameters.Root | Should -Be '{framework_root}'
+        $s.Entry.Parameters.Out | Should -Be '{out}'
+        $s.Outputs | Should -Be @('diff.json', 'diff.md', 'verdict.txt')
+        $s.Order | Should -Be 90
+        $s.Cadence | Should -Be 'every'
+        $s.Needs | Should -Be @('Shape')
     }
 
     It 'Coverage and Diff need Shape; the real order runs Shape before both and Diff last' {
@@ -1169,6 +1182,18 @@ Describe 'Getter needs and outcomes' {
         Join-Path $root '.framework' 'heartbeats' | Should -Not -Exist
     }
 
+    It 'refuses a getter that would run after Diff, by order or by needs' {
+        # By order: rows built directly, since a manifest with Diff not last fails to load.
+        $byOrder = @(
+            [pscustomobject]@{ Name = 'Diff'; Order = 5; Needs = @() }
+            [pscustomobject]@{ Name = 'Late'; Order = 6; Needs = @() }
+        )
+        { Get-FrameworkGetterOrder $byOrder } | Should -Throw '*refuses to start*Late after Diff*'
+        # By needs: Diff has the highest order, so this loads, but After needs Diff and would run after it.
+        $body = @((Get-Row 'After' 1 'Diff'), (Get-Row 'Diff' 2)) -join "`n"
+        { Get-FrameworkGetterOrder (Get-FrameworkManifest (Write-Needs 'after-diff' $body)).Getters } | Should -Throw '*refuses to start*After after Diff*'
+    }
+
     It 'refuses a need naming no getter' {
         $body = @((Get-Row 'A' 1 'Nope'), (Get-Row 'B' 2)) -join "`n"
         { Get-FrameworkGetterOrder (Get-FrameworkManifest (Write-Needs 'unknown' $body)).Getters } | Should -Throw '*refuses to start*unknown getter*A needs Nope*'
@@ -1211,6 +1236,83 @@ Describe 'Getter needs and outcomes' {
         $o = Get-FrameworkGetterOutcomes (Join-Path $nFramework '.framework' 'heartbeats')
         $o.Stamp | Should -Be $nHb.Stamp
         $o.Ok, $o.Failed, $o.Refused, $o.Skipped | Should -Be @(1, 1, 1, 4)
+    }
+}
+
+Describe 'Diff with no earlier heartbeat' {
+    BeforeAll {
+        # The real Diff entry and its module, copied from repos\Claude.Modules into a fixture getter repo.
+        $mods = Join-Path $FrameworkRoot 'repos' 'Claude.Modules'
+        $dRepos = Join-Path $RunRoot 'diff-repos'
+        $dMods = Join-Path $dRepos 'Mods'
+        $null = New-Item -ItemType Directory -Path (Join-Path $dMods 'tools'), (Join-Path $dMods 'modules') -Force
+        Copy-Item -LiteralPath (Join-Path $mods 'tools' 'Get-FrameworkDiff.ps1') -Destination (Join-Path $dMods 'tools')
+        Copy-Item -LiteralPath (Join-Path $mods 'modules' 'FrameworkDiff') -Destination (Join-Path $dMods 'modules') -Recurse
+        G $dMods init --quiet --initial-branch=main | Out-Null
+        G $dMods add -A | Out-Null
+        G $dMods commit --quiet -m fixture | Out-Null
+        $dYaml = Join-Path $RunRoot 'fixture-diff.yaml'
+        Set-Content -LiteralPath $dYaml -Value @"
+requirements:
+  pester: '$([string](Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Requirements.pester)'
+children:
+  - name: Mods
+    url: https://example.invalid/Mods.git
+    default_branch: main
+    branch: main
+    build_script: false
+getters:
+  - name: Diff
+    path: Mods
+    entry:
+      script: tools/Get-FrameworkDiff.ps1
+      parameters:
+        Root: '{framework_root}'
+        Out: '{out}'
+    outputs: [diff.json, diff.md, verdict.txt]
+    cadence: every
+    order: 90
+"@
+        $dFramework = Join-Path $RunRoot 'diff-framework'
+        $null = New-Item -ItemType Directory -Path $dFramework -Force
+        Set-Content -LiteralPath (Join-Path $dFramework '.gitignore') -Value '.framework/'
+        G $dFramework init --quiet --initial-branch=main | Out-Null
+        G $dFramework add -A | Out-Null
+        G $dFramework commit --quiet -m fixture | Out-Null
+        $run = Join-Path $dFramework '.framework' 'test-runs' '20260101-000000-001'
+        $null = New-Item -ItemType Directory -Path $run -Force
+        Set-Content -LiteralPath (Join-Path $run 'summary.json') -Value (@{
+                partial = $false; only = @(); env = @{}
+                rows = @(@{ Name = 'Mods'; Result = 'no build script'; Verify = 'not applicable' }, @{ Name = 'Claude.Framework'; Result = 'pass'; Verify = 'not applicable' })
+            } | ConvertTo-Json -Depth 4)
+        $dHb = Invoke-FrameworkHeartbeat -Manifest (Get-FrameworkManifest $dYaml) -ReposRoot $dRepos -FrameworkRoot $dFramework -SkipUp
+        $dRow = $dHb.Getters | Where-Object Name -eq 'Diff'
+    }
+
+    It 'the only heartbeat''s Diff is refused, not failed: "no earlier heartbeat to compare", nothing written, no call for Status' {
+        @(Get-ChildItem -LiteralPath (Join-Path $dFramework '.framework' 'heartbeats') -Directory).Count | Should -Be 1
+        $dRow.Result | Should -Be 'refused'
+        $dRow.Note | Should -BeLike 'refused: no earlier heartbeat to compare*'
+        $dRow.Verdict | Should -Be 'refused: no earlier heartbeat to compare'
+        foreach ($f in 'diff.json', 'diff.md', 'verdict.txt') { Join-Path $dHb.Folder 'Diff' $f | Should -Not -Exist }
+        $dHb.Outcomes.refused | Should -Be 1
+        $dHb.Outcomes.failed | Should -Be 0
+        $o = Get-FrameworkGetterOutcomes (Join-Path $dFramework '.framework' 'heartbeats')
+        $o.Refused | Should -Be 1
+        $o.Call | Should -BeNullOrEmpty
+    }
+
+    It 'Status reads Diff''s call from the newest heartbeat''s diff verdict' {
+        $root = Join-Path $RunRoot 'diff-call'
+        $hb = Join-Path $root '20260101-000000-001'
+        $null = New-Item -ItemType Directory -Path $hb -Force
+        Set-Content -LiteralPath (Join-Path $hb 'heartbeat.json') -Value (@{
+                getters = @(@{ name = 'Shape'; result = 'ok' }, @{ name = 'Diff'; result = 'ok' })
+                diff    = '3 better, 1 worse, 0 unknown: mixed'
+            } | ConvertTo-Json -Depth 4)
+        $o = Get-FrameworkGetterOutcomes $root
+        $o.Ok | Should -Be 2
+        $o.Call | Should -Be 'mixed'
     }
 }
 

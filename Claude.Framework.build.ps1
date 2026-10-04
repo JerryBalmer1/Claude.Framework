@@ -14,7 +14,8 @@
     Sync          clones or fast-forwards every child in framework.yaml into repos/.
     Status        prints branch (with "(expected <x>)" when it differs from framework.yaml), ahead/behind, dirty count, last commit, build script and TestedAt per child.
                   TestedAt is the commit of the newest run record, with 'stale' when HEAD has moved since. Then how many
-                  getters in the newest heartbeat ended ok, failed, refused and skipped.
+                  getters in the newest heartbeat ended ok, failed, refused and skipped, with Diff's call beside them
+                  when that heartbeat has one.
     Test          runs each child's test_task (default Test; full_test_task with -Full, where declared) in a fresh
                   pwsh in its folder (tasks_before_test first), then SelfTest the same way; prints actual against
                   the expect block in framework.yaml, with the commit tested (* when dirty). A child's verify is
@@ -30,7 +31,7 @@
                   Verify is heartbeat-only unless -Verify.
     Heartbeat     Requirements, Sync, Test (never Verify), then Verify for every child that declares it, then each
                   getter in framework.yaml in its own fresh pwsh rooted in its path under repos/, its Pester when
-                  tests: true, Diff last against the previous heartbeat, then Status. Getters run after the getters
+                  tests: true, Diff last against the newest earlier heartbeat, then Status. Getters run after the getters
                   their needs: name, ties broken by order; a need naming no getter, or needs in a cycle, refuse the run
                   before Sync. Each getter ends ok, failed, refused (non-zero exit, last line beginning "refused", kept
                   as the reason) or skipped; one whose need failed or refused is skipped with "needs <x>". Each row
@@ -93,7 +94,7 @@ task Status {
     Get-FrameworkStatus -Manifest (Get-FrameworkManifest $ManifestPath) -ReposRoot $ReposRoot -RunsRoot (Join-Path $BuildRoot '.framework' 'test-runs') |
         Format-Table -AutoSize | Out-String -Width 200
     $o = Get-FrameworkGetterOutcomes (Join-Path $BuildRoot '.framework' 'heartbeats')
-    if ($o) { print Cyan "Getters (heartbeat $($o.Stamp)): ok $($o.Ok), failed $($o.Failed), refused $($o.Refused), skipped $($o.Skipped)" }
+    if ($o) { print Cyan "Getters (heartbeat $($o.Stamp)): ok $($o.Ok), failed $($o.Failed), refused $($o.Refused), skipped $($o.Skipped)$(if ($o.Call) { "; diff $($o.Call)" })" }
     else { print Cyan 'Getters: no heartbeat yet' }
 }
 

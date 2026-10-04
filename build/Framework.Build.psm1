@@ -205,18 +205,21 @@ function Get-GetterOutcome {
 
 function Get-FrameworkGetterOutcomes {
     # How many getters in the newest heartbeat.json under $HeartbeatsRoot ended ok, failed, refused and skipped,
-    # with that heartbeat's stamp; $null when there is none.
+    # with that heartbeat's stamp and Diff's call (improved, regressed, mixed or unchanged) when its diff verdict reads
+    # "N better, N worse, N unknown: <call>", else $null; $null when there is no heartbeat.
     param([string]$HeartbeatsRoot)
     foreach ($f in Get-StampFolders $HeartbeatsRoot) {
         $file = Join-Path $f.FullName 'heartbeat.json'
         if (-not (Test-Path -LiteralPath $file)) { continue }
-        $results = @((Get-Content -LiteralPath $file -Raw | ConvertFrom-Json).getters | ForEach-Object { Get-GetterOutcome $_.result })
+        $hb = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
+        $results = @($hb.getters | ForEach-Object { Get-GetterOutcome $_.result })
         return [pscustomobject]@{
             Stamp   = $f.Name
             Ok      = @($results | Where-Object { $_ -eq 'ok' }).Count
             Failed  = @($results | Where-Object { $_ -eq 'failed' }).Count
             Refused = @($results | Where-Object { $_ -eq 'refused' }).Count
             Skipped = @($results | Where-Object { $_ -eq 'skipped' }).Count
+            Call    = if ("$($hb.diff)" -match '^\d+ better, \d+ worse, \d+ unknown: (\S+)$') { $Matches[1] }
         }
     }
     $null
