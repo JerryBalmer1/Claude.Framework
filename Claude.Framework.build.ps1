@@ -16,7 +16,7 @@
                   TestedAt is the commit of the newest run record, with 'stale' when HEAD has moved since. Then how many
                   getters in the newest heartbeat ended ok, failed, refused and skipped, with Diff's call beside them
                   when that heartbeat has one, then one row per getter: its outcome and the verdict line from its
-                  <Getter>.result.json (the note when it left none).
+                  <Getter>.result.json (the note for a failed getter, and when it left none).
     Test          runs each child's test_task (default Test; full_test_task with -Full, where declared) in a fresh
                   pwsh in its folder (tasks_before_test first), then SelfTest the same way; prints actual against
                   the expect block in framework.yaml, with the commit tested (* when dirty). A child's verify is
@@ -34,11 +34,13 @@
                   getter in framework.yaml in its own fresh pwsh rooted in its path under repos/, its Pester when
                   tests: true, Diff last against the newest earlier heartbeat, then Status. Getters run after the getters
                   their needs: name, ties broken by order; a need naming no getter, or needs in a cycle, refuse the run
-                  before Sync. Each getter ends ok, failed, refused (non-zero exit, last line beginning "refused", kept
-                  as the reason) or skipped; one whose need failed or refused is skipped with "needs <x>". Each row
-                  carries its needs, getter and graded commits, seconds and verdict line; a declared output missing
-                  under {out} fails it. A failing getter does not stop the run; the task fails at the end if any getter
-                  failed or refused, or any child Test or Verify failed.
+                  before Sync. Each getter ends ok, failed, refused (last line beginning "refused:", kept as the
+                  reason; or no verdict regex in framework.yaml, so it never runs) or skipped; one whose need failed or
+                  refused is skipped with "needs <x>". ok means exit 0, every declared output present, and the last
+                  line printed matching the row's verdict regex; a last line "failed: <message>", a non-zero exit, a
+                  missing output or a non-matching last line fails it, the note saying which. Each row carries its
+                  needs, getter and graded commits, seconds and verdict line. A failing getter does not stop the run;
+                  the task fails at the end if any getter failed or refused, or any child Test or Verify failed.
                   -SkipUp skips Sync and Test and reuses the newest test run, refusing one that is partial (-Only) or
                   has no summary.json unless -AllowPartial, which stamps heartbeat.json partial with the untested
                   children. -Only names children and/or getters.

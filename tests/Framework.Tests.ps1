@@ -287,6 +287,36 @@ Describe 'framework.yaml getters' {
         $body = "  - name: Diff`n    entry: none`n    cadence: every`n    order: 5`n  - name: B`n    entry: none`n    cadence: every`n    order: 6"
         { Get-FrameworkManifest (Write-Getters 'diff-first' $body) } | Should -Throw '*Diff must be last*'
     }
+
+    It '<Name>''s verdict regex matches its tool''s verdict line and nothing after it' -ForEach @(
+        @{ Name = 'Dirty'; Good = '7 clean, 0 dirty, 0 wrong-branch, 0 nested, ok', '6 clean, 1 dirty, 0 wrong-branch, 0 nested, unfit' }
+        @{ Name = 'Signs'; Good = '12 signed, 0 unsigned, 0 dead, 0 unreadable, 7 wired, 0 missing, ok', '12 signed, 1 unsigned, 0 dead, 1 unreadable, 7 wired, 0 missing, holes' }
+        @{ Name = 'Shape'; Good = , '40 lit, 1 drift, 0 hole, 0 lie, 0 invalid, 2 skipped, 3 trivial' }
+        @{ Name = 'Secrets'; Good = , '0 high, 0 medium, 2 low, 1 allowlisted' }
+        @{ Name = 'Coverage'; Good = , '30 subjects, 20 covered, 4 named-elsewhere, 6 uncovered, 2 holes' }
+        @{ Name = 'Refusals'; Good = '5 heartbeats, 1 refused, 0 failed, 9 witnessed, review', '5 heartbeats, 0 refused, 2 failed, 9 witnessed, ok' }
+        @{ Name = 'Diff'; Good = '3 better, 1 worse, 0 unknown: mixed', '0 better, 0 worse, 2 unknown: unchanged', '1 better, 0 worse, 0 unknown: improved', '0 better, 1 worse, 0 unknown: regressed' }
+    ) {
+        $g = (Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Getters | Where-Object Name -eq $Name
+        $g.Verdict | Should -Not -BeNullOrEmpty
+        foreach ($line in $Good) { $line | Should -MatchExactly $g.Verdict }
+        # The 025134 Signs case: an exception printed after the verdict is the last line, and no contract accepts it.
+        'MethodInvocationException: Exception calling "Deserialize" with "1" argument(s): "found invalid mapping."' | Should -Not -Match $g.Verdict
+        "$($Good[0]) trailing" | Should -Not -Match $g.Verdict
+        'refused: no root' | Should -Not -Match $g.Verdict
+    }
+
+    It 'every runnable getter in framework.yaml has a verdict contract; entry: none rows need none' {
+        $g = (Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Getters
+        foreach ($x in @($g | Where-Object Entry)) { $x.Verdict | Should -Not -BeNullOrEmpty -Because $x.Name }
+        @($g | Where-Object { -not $_.Entry -and $_.Verdict }).Count | Should -Be 0
+    }
+
+    It 'reads verdict; one that is not a regex fails to load' {
+        (Get-FrameworkManifest (Write-Getters 'verdict' ($ok + "`n    verdict: '^\d+ ok$'"))).Getters[0].Verdict | Should -Be '^\d+ ok$'
+        (Get-FrameworkManifest (Write-Getters 'no-verdict' $ok)).Getters[0].Verdict | Should -BeNullOrEmpty
+        { Get-FrameworkManifest (Write-Getters 'bad-verdict' ($ok + "`n    verdict: '^(\d+ ok$'")) } | Should -Throw '*verdict is not a valid regex*'
+    }
 }
 
 Describe 'Heartbeat' {
@@ -321,12 +351,12 @@ Describe 'Heartbeat' {
 
         $hbRepos = Join-Path $RunRoot 'hb-repos'
         $goodHead = New-CommittedFolder (Join-Path $hbRepos 'getters' 'Good') @{
-            'tools/Write-Out.ps1'  = 'param($Out) Set-Content -LiteralPath (Join-Path $Out "out.txt") -Value "good"; exit 0'
+            'tools/Write-Out.ps1'  = 'param($Out) Set-Content -LiteralPath (Join-Path $Out "out.txt") -Value "good"; "good: 1 file"; exit 0'
             'tests/Good.Tests.ps1' = "Describe 'good' { It 'passes' { 1 | Should -Be 1 } }"
         }
         $null = New-CommittedFolder (Join-Path $hbRepos 'getters' 'Bad') @{ 'tools/Fail.ps1' = 'param($Out) "bad getter ran"; exit 1' }
         $null = New-CommittedFolder (Join-Path $hbRepos 'getters' 'Diff') @{
-            'tools/Compare.ps1' = 'param($Out, $Previous) $p = if ($Previous) { Split-Path $Previous -Leaf } else { "none" }; Set-Content -LiteralPath (Join-Path $Out "verdict.txt") -Value "previous: $p"'
+            'tools/Compare.ps1' = 'param($Out, $Previous) $p = if ($Previous) { Split-Path $Previous -Leaf } else { "none" }; Set-Content -LiteralPath (Join-Path $Out "verdict.txt") -Value "previous: $p"; "previous: $p"'
         }
         $hbYaml = Join-Path $RunRoot 'fixture-heartbeat.yaml'
         Set-Content -LiteralPath $hbYaml -Value @"
@@ -344,6 +374,7 @@ getters:
       script: tools/Write-Out.ps1
       parameters:
         Out: '{out}'
+    verdict: '^good: \d+ files?$'
     tests: true
     cadence: every
     order: 1
@@ -353,6 +384,7 @@ getters:
       script: tools/Fail.ps1
       parameters:
         Out: '{out}'
+    verdict: '^bad$'
     cadence: every
     order: 2
   - name: Later
@@ -367,6 +399,7 @@ getters:
       parameters:
         Out: '{out}'
         Previous: '{previous}'
+    verdict: '^previous: \S+$'
     cadence: every
     order: 9
 "@
@@ -385,7 +418,7 @@ getters:
         $first.Getters.Name | Should -Be @('Good', 'Bad', 'Later', 'Diff')
         $by['Good'].Result | Should -Be 'ok'
         $by['Bad'].Result | Should -Be 'failed'
-        $by['Bad'].Note | Should -Match 'entry exit 1'
+        $by['Bad'].Note | Should -Be 'bad getter ran'
         $by['Diff'].Result | Should -Be 'ok'
         Join-Path $first.Folder 'Good' 'out.txt' | Should -Exist
         Get-Content (Join-Path $first.Folder 'Bad.log') | Should -Contain 'bad getter ran'
@@ -1075,6 +1108,7 @@ getters:
         Out: '{out}'
         Repos: '{repos_root}'
     outputs: [findings.json, summary.md]
+    verdict: '^\d+ high, \d+ medium, \d+ low, \d+ allowlisted$'
     cadence: every
     order: 1
   - name: Short
@@ -1085,6 +1119,7 @@ getters:
         Root: '{framework_root}'
         Out: '{out}'
     outputs: [findings.json, absent.md]
+    verdict: '^\d+ high, \d+ medium, \d+ low, \d+ allowlisted$'
     cadence: every
     order: 2
 "@
@@ -1161,7 +1196,7 @@ Describe 'Getter needs and outcomes' {
             G $dir add -A | Out-Null
             G $dir commit --quiet -m fixture | Out-Null
         }
-        $runnable = { param($Name, $Dir, $Order, $Needs) "  - name: $Name`n    path: getters/$Dir`n    entry:`n      script: tools/Run.ps1`n      parameters:`n        Out: '{out}'`n    cadence: every`n    order: $Order" + $(if ($Needs) { "`n    needs: [$Needs]" }) }
+        $runnable = { param($Name, $Dir, $Order, $Needs) "  - name: $Name`n    path: getters/$Dir`n    entry:`n      script: tools/Run.ps1`n      parameters:`n        Out: '{out}'`n    verdict: '^all fine$'`n    cadence: every`n    order: $Order" + $(if ($Needs) { "`n    needs: [$Needs]" }) }
         $body = @(
             & $runnable 'Chain' 'Dep' 1 'Dep'
             & $runnable 'Base' 'Base' 2
@@ -1239,12 +1274,12 @@ Describe 'Getter needs and outcomes' {
         (Get-Content (Join-Path $nHb.Folder 'Dep.result.json') -Raw | ConvertFrom-Json).needs | Should -Be @('Base')
     }
 
-    It 'parses refused from a stub getter: non-zero exit, last line kept as the reason' {
+    It 'parses refused from a stub getter: last line "refused: ..." kept as the reason' {
         $nBy['Ref'].Result | Should -Be 'refused'
         $nBy['Ref'].Note | Should -Be 'refused: Out lies inside Root'
         $nBy['Ref'].Verdict | Should -Be 'refused: Out lies inside Root'
         $nBy['Base'].Result | Should -Be 'failed'
-        $nBy['Base'].Note | Should -Be 'entry exit 1'
+        $nBy['Base'].Note | Should -Be 'base broke'
         $nHb.Failures | Should -Be @('getter Base', 'getter Ref')
     }
 
@@ -1258,6 +1293,116 @@ Describe 'Getter needs and outcomes' {
         $o = Get-FrameworkGetterOutcomes (Join-Path $nFramework '.framework' 'heartbeats')
         $o.Stamp | Should -Be $nHb.Stamp
         $o.Ok, $o.Failed, $o.Refused, $o.Skipped | Should -Be @(1, 1, 1, 4)
+    }
+}
+
+Describe 'Getter output is graded by contract' {
+    BeforeAll {
+        # The stub getters in tests\fixtures\contract-getters, committed into a fixture repo under a fixture repos\.
+        $cRepos = Join-Path $RunRoot 'contract-repos'
+        $cStubs = Join-Path $cRepos 'Stubs'
+        $null = New-Item -ItemType Directory -Path $cStubs -Force
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'fixtures' 'contract-getters' 'tools') -Destination $cStubs -Recurse
+        G $cStubs init --quiet --initial-branch=main | Out-Null
+        G $cStubs add -A | Out-Null
+        G $cStubs commit --quiet -m fixture | Out-Null
+        $signsVerdict = '^\d+ signed, \d+ unsigned, \d+ dead, \d+ unreadable, \d+ wired, \d+ missing, (ok|holes)$'
+        $row = {
+            param($Name, $Script, $Order, $Outputs = 'a.json, a.md', $Verdict = '^\d+ good, \d+ bad$')
+            "  - name: $Name`n    path: Stubs`n    entry:`n      script: tools/$Script`n      parameters:`n        Out: '{out}'`n    outputs: [$Outputs]" +
+            $(if ($Verdict) { "`n    verdict: '$Verdict'" }) + "`n    cadence: every`n    order: $Order"
+        }
+        $body = @(
+            & $row 'Signs' 'Signs-025134.ps1' 1 'signs.json, signs.md' $signsVerdict
+            & $row 'Ok' 'Ok.ps1' 2
+            & $row 'Refused' 'Refused.ps1' 3
+            & $row 'Failed' 'Failed.ps1' 4
+            & $row 'ExitNonZero' 'ExitNonZero.ps1' 5
+            & $row 'MissingOutput' 'MissingOutput.ps1' 6
+            & $row 'Mismatch' 'Mismatch.ps1' 7
+            & $row 'NoContract' 'Ok.ps1' 8 -Verdict $null
+        ) -join "`n"
+        $cYaml = Join-Path $RunRoot 'fixture-contract.yaml'
+        Set-Content -LiteralPath $cYaml -Value "requirements:`n  pester: '$([string](Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Requirements.pester)'`nchildren:`n  - name: Kid`n    url: https://example.invalid/Kid.git`n    default_branch: main`n    build_script: false`ngetters:`n$body"
+        $cFramework = Join-Path $RunRoot 'contract-framework'
+        $null = New-Item -ItemType Directory -Path $cFramework -Force
+        Set-Content -LiteralPath (Join-Path $cFramework '.gitignore') -Value '.framework/'
+        G $cFramework init --quiet --initial-branch=main | Out-Null
+        G $cFramework add -A | Out-Null
+        G $cFramework commit --quiet -m fixture | Out-Null
+        $run = Join-Path $cFramework '.framework' 'test-runs' '20260101-000000-001'
+        $null = New-Item -ItemType Directory -Path $run -Force
+        Set-Content -LiteralPath (Join-Path $run 'summary.json') -Value (@{
+                partial = $false; only = @(); env = @{}
+                rows = @(@{ Name = 'Kid'; Result = 'no build script'; Verify = 'not applicable' }, @{ Name = 'Claude.Framework'; Result = 'pass'; Verify = 'not applicable' })
+            } | ConvertTo-Json -Depth 4)
+        $cHb = Invoke-FrameworkHeartbeat -Manifest (Get-FrameworkManifest $cYaml) -ReposRoot $cRepos -FrameworkRoot $cFramework -SkipUp
+        $cBy = @{}; $cHb.Getters | ForEach-Object { $cBy[$_.Name] = $_ }
+        $cRec = { param($Name) Get-Content -LiteralPath (Join-Path $cHb.Folder "$Name.result.json") -Raw | ConvertFrom-Json }
+    }
+
+    It 'the 025134 Signs case: verdict line, then exception text, exit 0, is failed with the contract note' {
+        Get-Content -LiteralPath (Join-Path $cHb.Folder 'Signs.log') | Should -Contain '12 signed, 0 unsigned, 0 dead, 0 unreadable, 7 wired, 0 missing, ok'
+        $cBy['Signs'].Result | Should -Be 'failed'
+        $cBy['Signs'].Note | Should -BeLike 'verdict did not match contract: *found invalid mapping.*'
+        $cBy['Signs'].Verdict | Should -BeNullOrEmpty
+        (& $cRec 'Signs').result | Should -Be 'failed'
+        $cHb.Failures | Should -Contain 'getter Signs'
+    }
+
+    It 'a last line "refused: ..." is refused, that line the note, its missing outputs not counted' {
+        $cBy['Refused'].Result | Should -Be 'refused'
+        $cBy['Refused'].Note | Should -Be 'refused: Out lies inside Root'
+        $cBy['Refused'].Verdict | Should -Be 'refused: Out lies inside Root'
+    }
+
+    It 'a last line "failed: ..." is failed, that line the note, even at exit 0 with every output written' {
+        $cBy['Failed'].Result | Should -Be 'failed'
+        $cBy['Failed'].Note | Should -Be 'failed: could not read framework.yaml'
+        $cBy['Failed'].Verdict | Should -BeNullOrEmpty
+    }
+
+    It 'a non-zero exit is failed with the last line as the note, even when that line matches the contract' {
+        $cBy['ExitNonZero'].Result | Should -Be 'failed'
+        $cBy['ExitNonZero'].Note | Should -Be '2 good, 0 bad'
+        $cBy['ExitNonZero'].Verdict | Should -BeNullOrEmpty
+    }
+
+    It 'a declared output missing under {out} is failed, the note naming it, even at exit 0 with a matching line' {
+        $cBy['MissingOutput'].Result | Should -Be 'failed'
+        $cBy['MissingOutput'].Note | Should -Be 'missing output(s) under {out}: a.md'
+    }
+
+    It 'a last line not matching the row''s verdict regex is failed: "verdict did not match contract: " and the line' {
+        $cBy['Mismatch'].Result | Should -Be 'failed'
+        $cBy['Mismatch'].Note | Should -Be 'verdict did not match contract: 2 good'
+        $cBy['Mismatch'].Verdict | Should -BeNullOrEmpty
+    }
+
+    It 'otherwise ok, the verdict being the last line' {
+        $cBy['Ok'].Result | Should -Be 'ok'
+        $cBy['Ok'].Verdict | Should -Be '2 good, 0 bad'
+        (& $cRec 'Ok').verdict | Should -Be '2 good, 0 bad'
+    }
+
+    It 'a runnable row with no verdict: is refused, "no verdict contract in framework.yaml", and never runs' {
+        $cBy['NoContract'].Result | Should -Be 'refused'
+        $cBy['NoContract'].Note | Should -Be 'no verdict contract in framework.yaml'
+        Join-Path $cHb.Folder 'NoContract' | Should -Not -Exist
+        Join-Path $cHb.Folder 'NoContract.log' | Should -Not -Exist
+        $cHb.Failures | Should -Contain 'getter NoContract'
+    }
+
+    It 'Status prints failed and the note in place of a verdict; ok and refused unchanged' {
+        $lines = @(Format-FrameworkGetterStatus (Join-Path $cFramework '.framework' 'heartbeats'))
+        $lines[0] | Should -Be "Getters (heartbeat $($cHb.Stamp)): ok 1, failed 5, refused 2, skipped 0"
+        $at = { param($Name) $lines | Where-Object { $_ -match "^\s+$Name\s" } }
+        & $at 'Signs' | Should -Match 'failed\s+verdict did not match contract: .*found invalid mapping\.'
+        & $at 'Signs' | Should -Not -Match '12 signed'
+        & $at 'ExitNonZero' | Should -Match 'failed\s+2 good, 0 bad$'
+        & $at 'Ok' | Should -Match 'ok\s+2 good, 0 bad$'
+        & $at 'Refused' | Should -Match 'refused\s+refused: Out lies inside Root$'
+        & $at 'NoContract' | Should -Match 'refused\s+no verdict contract in framework\.yaml$'
     }
 }
 
@@ -1292,6 +1437,7 @@ getters:
         Root: '{framework_root}'
         Out: '{out}'
     outputs: [diff.json, diff.md, verdict.txt]
+    verdict: '^\d+ better, \d+ worse, \d+ unknown: (improved|regressed|mixed|unchanged)$'
     cadence: every
     order: 90
 "@
@@ -1364,6 +1510,8 @@ getters:
         $names = @($rows.Keys)
         for ($i = 0; $i -lt 7; $i++) { $verdicts[$i] | Should -Match "^\s+$($names[$i])\s+$($rows[$names[$i]].result)\s+" }
         $verdicts[0] | Should -Match '7 checkouts, 0 dirty: ok$'
+        # A failed getter shows its note in place of a verdict, even one it recorded.
+        $verdicts[4] | Should -Match 'failed\s+exit 1$'
         $verdicts[5] | Should -Match 'refused: no heartbeats folder$'
         $verdicts[6] | Should -Match 'needs Shape$'
     }
@@ -1410,6 +1558,7 @@ getters:
       script: tools/Run.ps1
       parameters:
         Out: '{out}'
+    verdict: '^ran$'
     cadence: every
     order: 1
 "@

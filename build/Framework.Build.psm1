@@ -90,14 +90,15 @@ function ConvertTo-FrameworkGetter {
     # One getters entry. name, order, cadence and entry are required; path is required unless entry is none.
     # path is relative to repos/ (CLAUDE.md: a getter runs only from under repos/), so it may not be rooted or climb.
     # entry is none, or a mapping: script (a .ps1 under tools/) and optional parameters, whose values may hold
-    # {out}, {previous}, {framework_root} and {repos_root}. outputs lists file names the entry must leave under {out}.
+    # {out}, {previous}, {framework_root} and {repos_root}. outputs lists file names the entry must leave under {out};
+    # verdict is the regex its last printed line must match.
     param($Block)
     if ($Block -isnot [System.Collections.IDictionary]) { throw "Manifest getters: each entry must be a mapping." }
     $name = $Block['name']
     foreach ($field in 'name', 'order', 'cadence', 'entry') {
         if (-not $Block.Contains($field) -or $null -eq $Block[$field] -or "$($Block[$field])" -eq '') { throw "Manifest getter '$name' is missing '$field'." }
     }
-    $unknown = @($Block.Keys | Where-Object { $_ -notin 'name', 'path', 'entry', 'tests', 'expects', 'outputs', 'cadence', 'order', 'note', 'needs' })
+    $unknown = @($Block.Keys | Where-Object { $_ -notin 'name', 'path', 'entry', 'tests', 'expects', 'outputs', 'cadence', 'order', 'note', 'needs', 'verdict' })
     if ($unknown) { throw "Manifest getter '$name': unknown key(s) $($unknown -join ', ')." }
     if (($Block.order -isnot [int] -and $Block.order -isnot [long]) -or $Block.order -lt 0) { throw "Manifest getter '$name': order must be a whole number >= 0." }
     if ("$($Block.cadence)" -notin 'every', 'weekly') { throw "Manifest getter '$name': cadence must be every or weekly, not '$($Block.cadence)'." }
@@ -139,6 +140,14 @@ function ConvertTo-FrameworkGetter {
             if ($n -isnot [string] -or -not $n) { throw "Manifest getter '$name': each need must be a getter name, not '$n'." }
             $n
         })
+    # verdict is the regex an ok getter's last printed line must match. A runnable getter without one still loads;
+    # Heartbeat refuses to run it. One that is not a regex fails to load.
+    $verdict = $null
+    if ($null -ne $Block['verdict']) {
+        if ($Block.verdict -isnot [string] -or -not $Block.verdict) { throw "Manifest getter '$name': verdict must be a regex string." }
+        try { $null = [regex]::new($Block.verdict) } catch { throw "Manifest getter '$name': verdict is not a valid regex: $($_.Exception.InnerException.Message)" }
+        $verdict = $Block.verdict
+    }
     [pscustomobject]@{
         Name    = [string]$name
         Path    = if ($null -ne $path) { [string]$path }
@@ -146,6 +155,7 @@ function ConvertTo-FrameworkGetter {
         Needs   = @($needs | Select-Object -Unique)
         Tests   = $tests
         Outputs = $outputs
+        Verdict = $verdict
         Expect  = ConvertTo-ChildExpectation -Name $name -Block $Block['expects']
         Cadence = [string]$Block.cadence
         Order   = [int]$Block.order
@@ -208,7 +218,7 @@ function Get-FrameworkGetterOutcomes {
     # with that heartbeat's stamp and Diff's call (improved, regressed, mixed or unchanged) when its diff verdict reads
     # "N better, N worse, N unknown: <call>", else $null; $null when there is no heartbeat. Rows holds one entry per
     # getter in heartbeat.json order (Name, Result, Verdict), read from that heartbeat's <Getter>.result.json, with the
-    # note standing in for a getter that left no verdict line.
+    # note standing in for a failed getter and for one that left no verdict line.
     param([string]$HeartbeatsRoot)
     foreach ($f in Get-StampFolders $HeartbeatsRoot) {
         $file = Join-Path $f.FullName 'heartbeat.json'
@@ -219,8 +229,9 @@ function Get-FrameworkGetterOutcomes {
                 $rf = Join-Path $f.FullName "$($g.name).result.json"
                 if (-not (Test-Path -LiteralPath $rf)) { [pscustomobject]@{ Name = $g.name; Result = Get-GetterOutcome $g.result; Verdict = 'no result.json' }; continue }
                 $r = Get-Content -LiteralPath $rf -Raw | ConvertFrom-Json
-                $verdict = if ("$($r.verdict)") { "$($r.verdict)" } elseif ("$($r.note)") { "$($r.note)" } else { '-' }
-                [pscustomobject]@{ Name = $g.name; Result = Get-GetterOutcome $r.result; Verdict = $verdict }
+                $result = Get-GetterOutcome $r.result
+                $verdict = if ($result -ne 'failed' -and "$($r.verdict)") { "$($r.verdict)" } elseif ("$($r.note)") { "$($r.note)" } else { '-' }
+                [pscustomobject]@{ Name = $g.name; Result = $result; Verdict = $verdict }
             })
         return [pscustomobject]@{
             Stamp   = $f.Name
@@ -1070,7 +1081,8 @@ function Invoke-FrameworkHeartbeat {
     # getter in its own fresh pwsh rooted in its path under repos/, its Pester when tests: true, Diff last against the
     # previous heartbeat. Getters run after the getters they need, ties broken by order; an unknown need or a cycle
     # refuses the run before it starts. Each getter ends ok, failed, refused or skipped; one whose need failed or
-    # refused is skipped with "needs <x>". A failing getter is recorded and the next one runs. Output, logs and one
+    # refused is skipped with "needs <x>". ok is graded by contract: exit 0, every declared output present and the last
+    # printed line matching the row's verdict regex; a runnable getter with no verdict regex is refused, not run. A failing getter is recorded and the next one runs. Output, logs and one
     # <getter>.result.json per getter go to .framework/heartbeats/<stamp>/, which keeps the latest -KeepRuns folders;
     # heartbeat.json at its root is the record. -Only names children and/or getters; anything not named is skipped.
     # Failures lists every getter failed or refused, child Test FAIL and Verify 'does not'; the build fails the task on any.
@@ -1218,6 +1230,8 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
         $result, $note = if (-not (& $selected $g.Name)) { 'skipped', '-Only' }
         elseif ($unmet) { 'skipped', "needs $($unmet -join ', ')" }
         elseif (-not $g.Entry) { 'skipped', ((@('entry: none', $g.Note) | Where-Object { $_ }) -join '; ') }
+        # With no contract, an ok could not be told from a crash that happened to exit 0.
+        elseif (-not $g.Verdict) { 'refused', 'no verdict contract in framework.yaml' }
         elseif (-not (Test-Path -LiteralPath $path -PathType Container)) { 'skipped', "repos/$($g.Path) not found" }
         elseif ($refusal) { 'refused', "$($owner.Name) $refusal" }
         elseif ($g.Cadence -eq 'weekly' -and $g.Name -notin @($Only) -and $lastRan.ContainsKey($g.Name) -and $lastRan[$g.Name] -gt [DateTimeOffset]::Now.AddDays(-7)) {
@@ -1235,12 +1249,11 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
             $notes = [System.Collections.Generic.List[string]]::new()
             if ($g.Note) { $notes.Add($g.Note) }
             $exit = Invoke-ChildProcess -WorkingDirectory $path -Script $getterScript -ArgumentList $g.Entry.Script, ($inv.Parameters | ConvertTo-Json -Compress -Depth 4) -LogFile (Join-Path $folder "$($g.Name).log")
-            if ($exit -ne 0) { $notes.Add("entry exit $exit") }
-            # The last line the entry printed. A non-zero exit whose last line begins with "refused" is a refusal, and
+            # The last line the entry printed, error text included. A last line "refused: <reason>" is a refusal, and
             # that line is its reason; its tests and outputs are not checked.
             $printed = @(Get-Content -LiteralPath (Join-Path $folder "$($g.Name).log") -ErrorAction SilentlyContinue | Where-Object { "$_".Trim() })
-            $lastLine = if ($printed) { "$($printed[-1])".Trim() }
-            $refused = $exit -ne 0 -and $lastLine -like 'refused*'
+            $lastLine = if ($printed) { "$($printed[-1])".Trim() } else { '' }
+            $refused = $lastLine -cmatch '^refused:'
             $verdict = $null
             if ($g.Tests -and -not $refused) {
                 $junit = Join-Path $out "$($g.Name).junit.xml"
@@ -1251,19 +1264,20 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
                 $verdict = Get-TestVerdict -ExitCode $texit -Counts $counts -Expect $g.Expect -TestFileCount $files
                 if ($verdict.Note) { $notes.Add("tests $($verdict.Result): $($verdict.Note)") }
             }
-            $missing = @(if (-not $refused) { $g.Outputs | Where-Object { -not (Test-Path -LiteralPath (Join-Path $out $_) -PathType Leaf) } })
-            if ($missing) { $notes.Add("missing output(s) under {out}: $($missing -join ', ')") }
-            if ($refused) { $notes.Clear(); $notes.Add($lastLine) }
-            $result = if ($refused) { 'refused' } elseif ($exit -ne 0 -or $missing -or ($verdict -and $verdict.Result -eq 'FAIL')) { 'failed' } else { 'ok' }
-            # The verdict line: the first line of verdict.txt in the getter's output, else the last line it printed.
-            $vf = Join-Path $out 'verdict.txt'
-            $verdictLine = $lastLine
-            if (Test-Path -LiteralPath $vf) {
-                $vlines = @(Get-Content -LiteralPath $vf | Where-Object { "$_".Trim() })
-                $verdictLine = if ($vlines) { "$($vlines[0])".Trim() }
-            }
+            $missing = @($g.Outputs | Where-Object { -not (Test-Path -LiteralPath (Join-Path $out $_) -PathType Leaf) })
+            # The contract, first rule that holds wins. ok is exit 0, every declared output present and a last line
+            # matching the row's verdict regex; nothing else counts. Only ok records a verdict; failed says why in note.
+            $result, $why = if ($refused) { 'refused', $lastLine }
+            elseif ($lastLine -cmatch '^failed:') { 'failed', $lastLine }
+            elseif ($exit -ne 0) { 'failed', $(if ($lastLine) { $lastLine } else { "entry exit $exit, nothing printed" }) }
+            elseif ($missing) { 'failed', "missing output(s) under {out}: $($missing -join ', ')" }
+            elseif ($lastLine -cnotmatch $g.Verdict) { 'failed', "verdict did not match contract: $lastLine" }
+            elseif ($verdict -and $verdict.Result -eq 'FAIL') { 'failed', $null }
+            else { 'ok', $null }
+            $verdictLine = if ($result -in 'ok', 'refused') { $lastLine }
+            if ($why) { $notes.Clear(); $notes.Add($why) }
             if ($g.Name -eq 'Diff') {
-                if (-not $previous) { $notes.Add('no previous heartbeat') }
+                if (-not $previous -and $result -ne 'failed') { $notes.Add('no previous heartbeat') }
                 $diffVerdict = $verdictLine
             }
             $note = $notes -join '; '

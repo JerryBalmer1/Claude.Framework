@@ -98,13 +98,18 @@ children:
 #               {out} (this getter's folder under .framework/heartbeats/<stamp>/), {previous} (the previous
 #               heartbeat folder), {framework_root} and {repos_root}
 #   path        relative to repos/; required unless entry is none
+#   verdict     a regex (case-sensitive) the last line the entry prints must match; required unless entry is none.
+#               A runnable getter without one is refused with "no verdict contract in framework.yaml" and never runs.
 # Optional: needs (getter names that must run first; one that failed or refused skips this getter with "needs <x>";
 # an unknown name or a cycle refuses the heartbeat before it starts), tests (true runs the getter's Pester, JUnit under
 # its output folder), expects (expected_failures or no_tests, each with reason), outputs (file names the entry must
 # leave under {out}; a missing one fails the getter), note. A getter whose path is a child's folder runs only while
 # that child is on its expected branch.
-# Each getter ends ok, failed, refused or skipped. Refused is a non-zero exit whose last printed line begins "refused".
-# The verdict line is the first line of {out}/verdict.txt, else the last line the entry printed.
+# Each getter ends ok, failed, refused or skipped. The last line the entry printed decides, checked in this order:
+# "refused: <reason>" is refused; "failed: <message>" is failed; a non-zero exit is failed; a declared output missing
+# under {out} is failed; a last line not matching verdict is failed ("verdict did not match contract: <line>").
+# ok means exit 0, every declared output present, and the last stdout line matching the row's verdict regex; nothing else counts.
+# The verdict recorded for an ok getter is that last line; a failed getter records no verdict, only its note.
 # Dirty, Signs, Shape, Secrets, Coverage, Refusals and Diff are promoted (Claude.Modules); the others are entry: none
 # with no path until they are. Dirty runs first: it grades whether the checkouts are fit to be graded at all.
 # Refusals and Diff read earlier heartbeats. Refusals reads their heartbeat.json files; the current heartbeat's is not
@@ -119,6 +124,7 @@ getters:
         Root: '{framework_root}'
         Out: '{out}'
     outputs: [dirty.json, dirty.md]
+    verdict: '^\d+ clean, \d+ dirty, \d+ wrong-branch, \d+ nested, (ok|unfit)$'
     tests: false
     cadence: every
     order: 10
@@ -138,6 +144,7 @@ getters:
         Root: '{framework_root}'
         Out: '{out}'
     outputs: [signs.json, signs.md]
+    verdict: '^\d+ signed, \d+ unsigned, \d+ dead, \d+ unreadable, \d+ wired, \d+ missing, (ok|holes)$'
     tests: false
     cadence: every
     order: 20
@@ -164,6 +171,7 @@ getters:
         Root: '{framework_root}'
         Out: '{out}'
     outputs: [graph.json]
+    verdict: '^\d+ lit, \d+ drift, \d+ hole, \d+ lie, \d+ invalid, \d+ skipped, \d+ trivial$'
     tests: false
     cadence: every
     order: 40
@@ -176,6 +184,7 @@ getters:
         Root: '{framework_root}'
         Out: '{out}'
     outputs: [findings.json, summary.md]
+    verdict: '^\d+ high, \d+ medium, \d+ low, \d+ allowlisted$'
     tests: false
     cadence: every
     order: 50
@@ -189,6 +198,7 @@ getters:
         Root: '{framework_root}'
         Out: '{out}'
     outputs: [coverage.json, coverage.md]
+    verdict: '^\d+ subjects, \d+ covered, \d+ named-elsewhere, \d+ uncovered, \d+ holes$'
     needs: [Shape]
     tests: false
     cadence: every
@@ -204,6 +214,7 @@ getters:
         Root: '{framework_root}'
         Out: '{out}'
     outputs: [refusals.json, refusals.md]
+    verdict: '^\d+ heartbeats, \d+ refused, \d+ failed, \d+ witnessed, (ok|review)$'
     tests: false
     cadence: every
     order: 80
@@ -218,6 +229,7 @@ getters:
         Root: '{framework_root}'
         Out: '{out}'
     outputs: [diff.json, diff.md, verdict.txt]
+    verdict: '^\d+ better, \d+ worse, \d+ unknown: (improved|regressed|mixed|unchanged)$'
     needs: [Shape]
     tests: false
     cadence: every
