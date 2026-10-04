@@ -4,19 +4,25 @@
     Invoke-Build script for Claude.Framework.
 
 .DESCRIPTION
-    Requirements  checks git, PowerShell, Pester, powershell-yaml, Docker and Docker Compose; fails if any is missing.
+    Requirements  checks git, PowerShell, Pester, powershell-yaml, Docker, Docker Compose, CLAUDE_CHAIN_LEDGER and
+                  Invoke-Build; reports each, fixes none, fails if any is not Ok.
     Bootstrap     runs build/Bootstrap.ps1 once; skipped while .framework/bootstrap.done exists, re-run with -Force.
     Sync          clones or fast-forwards every child in framework.yaml into repos/.
-    Status        prints branch, ahead/behind, dirty count, last commit and build script per child.
-    Test          runs each child's own Test in a fresh pwsh in its folder (tasks_before_test first, verify after),
-                  then SelfTest the same way; prints actual against the expect block in framework.yaml.
+    Status        prints branch, ahead/behind, dirty count, last commit, build script and TestedAt per child.
+                  TestedAt is the commit of the newest run record, with 'stale' when HEAD has moved since.
+    Test          runs each child's test_task (default Test; full_test_task with -Full, where declared) in a fresh
+                  pwsh in its folder (tasks_before_test first, verify after), then SelfTest the same way; prints
+                  actual against the expect block in framework.yaml, with the commit tested (* when dirty).
+                  -Only runs just the named children; the rest are listed as skipped (-Only).
                   Results go to .framework/test-runs/<stamp>/; the latest -KeepRuns run folders are kept.
     SelfTest      runs Framework's own Pester suite under tests/.
-    Up            Requirements, Bootstrap, Sync, Test, Status; stops at the first failing task.
+    Up            Requirements, Bootstrap, Sync, Test, Status; stops at the first failing task. Takes -Only and -Full.
 #>
 param(
-    # Limit Test to these child names (and/or Claude.Framework).
+    # Limit Test to these child names (and/or Claude.Framework). An unknown name fails before any child runs.
     [string[]]$Only,
+    # Run each child's full_test_task where one is declared.
+    [switch]$Full,
     # Run Bootstrap even when its marker exists.
     [switch]$Force,
     # How many run folders .framework/test-runs/ keeps.
@@ -49,13 +55,13 @@ task Sync {
 }
 
 task Status {
-    Get-FrameworkStatus -Manifest (Get-FrameworkManifest $ManifestPath) -ReposRoot $ReposRoot |
+    Get-FrameworkStatus -Manifest (Get-FrameworkManifest $ManifestPath) -ReposRoot $ReposRoot -RunsRoot (Join-Path $BuildRoot '.framework' 'test-runs') |
         Format-Table -AutoSize | Out-String -Width 200
 }
 
 task Test {
-    $rows = @(Invoke-FrameworkTest -Manifest (Get-FrameworkManifest $ManifestPath) -ReposRoot $ReposRoot -FrameworkRoot $BuildRoot -Only $Only -KeepRuns $KeepRuns)
-    $rows | Format-Table Name, Result, Expected, Passed, Failed, Skipped, Verify, Seconds, Note -AutoSize -Wrap | Out-String -Width 250
+    $rows = @(Invoke-FrameworkTest -Manifest (Get-FrameworkManifest $ManifestPath) -ReposRoot $ReposRoot -FrameworkRoot $BuildRoot -Only $Only -Full:$Full -KeepRuns $KeepRuns)
+    $rows | Format-Table Name, Task, Result, Expected, Passed, Failed, Skipped, Verify, Commit, Seconds, Note -AutoSize -Wrap | Out-String -Width 250
     $failed = @($rows | Where-Object { $_.Result -eq 'FAIL' -or $_.Verify -eq 'does not' })
     if ($failed) { throw "Test failed for: $($failed.Name -join ', '). Logs: .framework/test-runs/" }
 }

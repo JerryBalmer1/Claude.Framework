@@ -2,9 +2,15 @@
 # Claude.Ontology is the renamed Claude.Ontology.Plugins. Claude.Ontology.Old is the archive and is not listed.
 # Optional per child:
 #   expect.tasks_before_test  tasks the Test task runs first, each in its own child process
+#   expect.test_task          the task Test and plain Up run in the child (default Test)
+#   expect.full_test_task     the task Test -Full and Up -Full run instead, where declared
 #   expect.expected_failures  known failing tests; up to this many is pass-with-known, more is FAIL (needs reason)
 #   expect.no_tests           true when the child has no *.Tests.ps1 files; reported as no-tests (needs reason)
 #   verify                    a script under the child, run once per plugin after Test
+# Required when build_script is true:
+#   result_file               how Test gets a result file: parameter (the build takes -PesterConfiguration,
+#                             TestResult only), preference (the child's Invoke-Pester merges $PesterPreference),
+#                             or none (counts parsed from the Pester summary line the build prints)
 
 requirements:
   powershell: '7.4'
@@ -21,6 +27,7 @@ children:
     url: https://github.com/JerryBalmer1/Claude.Chain.git
     default_branch: main
     build_script: true
+    result_file: preference
 
   - name: Claude.Substrate
     url: https://github.com/JerryBalmer1/Claude.Substrate.git
@@ -36,15 +43,19 @@ children:
     url: https://github.com/JerryBalmer1/Claude.Skills.git
     default_branch: develop
     build_script: true
+    result_file: preference
     expect:
       no_tests: true
-      reason: no test files on develop
+      reason: no *.Tests.ps1 files in the checkout
 
   - name: Claude.Ontology
     url: https://github.com/JerryBalmer1/Claude.Ontology.git
     default_branch: main
     build_script: true
+    result_file: parameter
     expect:
+      test_task: Test
+      full_test_task: TestFull
       expected_failures: 16
       reason: contract tests need built graphs
     verify:
@@ -55,5 +66,6 @@ children:
     url: https://github.com/JerryBalmer1/Claude.Portal.git
     default_branch: main
     build_script: true
+    result_file: preference
     expect:
       tasks_before_test: [Install]

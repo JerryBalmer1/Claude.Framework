@@ -97,6 +97,36 @@ Describe 'framework.yaml' {
         $by['Claude.Chain'].Verify | Should -BeNullOrEmpty
     }
 
+    It 'reads result_file: parameter for Claude.Ontology, preference for the other build-script children' {
+        $by = @{}; $manifest.Children | ForEach-Object { $by[$_.Name] = $_ }
+        $by['Claude.Ontology'].ResultFile | Should -Be 'parameter'
+        'Claude.Chain', 'Claude.Skills', 'Claude.Portal' | ForEach-Object { $by[$_].ResultFile | Should -Be 'preference' }
+        $by['Claude.Root'].ResultFile | Should -BeNullOrEmpty
+    }
+
+    It 'reads test_task and full_test_task: Test and TestFull for Claude.Ontology, Test and none elsewhere' {
+        $by = @{}; $manifest.Children | ForEach-Object { $by[$_.Name] = $_ }
+        $by['Claude.Ontology'].Expect.TestTask | Should -Be 'Test'
+        $by['Claude.Ontology'].Expect.FullTestTask | Should -Be 'TestFull'
+        $by['Claude.Ontology'].Expect.ExpectedFailures | Should -Be 16
+        $by['Claude.Ontology'].Expect.Reason | Should -Be 'contract tests need built graphs'
+        $by['Claude.Chain'].Expect.TestTask | Should -Be 'Test'
+        $by['Claude.Chain'].Expect.FullTestTask | Should -BeNullOrEmpty
+    }
+
+    It 'the Claude.Skills no-tests reason names no branch' {
+        $skills = $manifest.Children | Where-Object Name -eq 'Claude.Skills'
+        $skills.Expect.Reason | Should -Not -Match 'develop|main|feature/'
+    }
+
+    It 'rejects a build-script child without result_file, and an unknown result_file' {
+        $bad = Join-Path $RunRoot 'bad-result.yaml'
+        Set-Content -LiteralPath $bad -Value "children:`n  - name: X`n    url: u`n    default_branch: main`n    build_script: true"
+        { Get-FrameworkManifest $bad } | Should -Throw '*result_file*'
+        Set-Content -LiteralPath $bad -Value "children:`n  - name: X`n    url: u`n    default_branch: main`n    build_script: true`n    result_file: junit"
+        { Get-FrameworkManifest $bad } | Should -Throw '*parameter, preference or none*'
+    }
+
     It 'rejects expected_failures without a reason' {
         $bad = Join-Path $RunRoot 'bad-expect.yaml'
         Set-Content -LiteralPath $bad -Value "children:`n  - name: X`n    url: u`n    default_branch: main`n    build_script: true`n    expect:`n      expected_failures: 2"
@@ -159,13 +189,14 @@ children:
     url: https://example.invalid/fixture.git
     default_branch: main
     build_script: true
+    result_file: preference
     expect:
       tasks_before_test: [Before]
       expected_failures: 1
       reason: the fixture fails one test on purpose
 "@
         $root = Join-Path $RunRoot 'framework-root'
-        $rows = @(Invoke-FrameworkTest -Manifest (Get-FrameworkManifest $yaml) -ReposRoot $childRepos -FrameworkRoot $root -Only Fixture)
+        $rows = @(Invoke-FrameworkTest -Manifest (Get-FrameworkManifest $yaml) -ReposRoot $childRepos -FrameworkRoot $root -Only Fixture | Where-Object Result -ne 'skipped (-Only)')
 
         $rows.Count | Should -Be 1
         $rows[0].Result | Should -Be 'pass-with-known'
@@ -177,6 +208,304 @@ children:
         Join-Path $run[0].FullName 'Fixture.junit.xml' | Should -Exist
         Join-Path $run[0].FullName 'Fixture.Before.log' | Should -Exist
         Get-Module FixtureChild | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Test gets a result file in the way result_file names' {
+    BeforeAll {
+        $pester = [string](Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Requirements.pester
+        $childRepos = Join-Path $RunRoot 'children-modes'
+        $tests = @'
+Describe 'fixture' {
+    It 'passes one' { 1 | Should -Be 1 }
+    It 'passes two' { 2 | Should -Be 2 }
+    It 'fails' { 1 | Should -Be 2 }
+    It 'skips' -Skip { }
+}
+'@
+        function New-FixtureChild {
+            param([string]$Name, [string]$Build)
+            $path = Join-Path $childRepos $Name
+            $null = New-Item -ItemType Directory -Path (Join-Path $path 'tests') -Force
+            G $path init --quiet --initial-branch=main | Out-Null
+            Set-Content -LiteralPath (Join-Path $path "$Name.build.ps1") -Value $Build
+            Set-Content -LiteralPath (Join-Path $path 'tests' "$Name.Tests.ps1") -Value $tests
+            $path
+        }
+
+        # Like Claude.Ontology: takes -PesterConfiguration, refuses any key but TestResult, ignores $PesterPreference.
+        $paramChild = New-FixtureChild 'ParamFixture' @'
+param([hashtable]$PesterConfiguration = @{})
+task Test {
+    $pref = $null -ne (Get-Variable PesterPreference -Scope Global -ValueOnly -ErrorAction SilentlyContinue)
+    $keys = @($PesterConfiguration.Keys) -join ','
+    $sub = if ($PesterConfiguration['TestResult']) { @($PesterConfiguration.TestResult.Keys | Sort-Object) -join ',' }
+    Set-Content -LiteralPath (Join-Path $BuildRoot 'received.txt') -Value "$keys|$sub|$pref"
+    $foreign = @($PesterConfiguration.Keys | Where-Object { $_ -ne 'TestResult' })
+    assert ($foreign.Count -eq 0) "PesterConfiguration may hold only TestResult, not: $($foreign -join ', ')."
+    $config = New-PesterConfiguration -Hashtable $PesterConfiguration
+    $config.Run.Path = Join-Path $BuildRoot 'tests'
+    $config.Run.PassThru = $true
+    $r = Invoke-Pester -Configuration $config
+    if ($r.FailedCount) { throw "$($r.FailedCount) failed" }
+}
+'@
+        $null = New-FixtureChild 'PrefFixture' @'
+task Test {
+    $config = New-PesterConfiguration
+    $config.Run.Path = Join-Path $BuildRoot 'tests'
+    $config.Run.PassThru = $true
+    $r = Invoke-Pester -Configuration $config
+    if ($r.FailedCount) { throw "$($r.FailedCount) failed" }
+}
+'@
+        # Writes no result file whatever it is offered: TestResult forced off.
+        $null = New-FixtureChild 'NoneFixture' @'
+task Test {
+    $config = New-PesterConfiguration
+    $config.Run.Path = Join-Path $BuildRoot 'tests'
+    $config.Run.PassThru = $true
+    $config.TestResult.Enabled = $false
+    $r = Invoke-Pester -Configuration $config
+    if ($r.FailedCount) { throw "$($r.FailedCount) failed" }
+}
+'@
+        $yaml = Join-Path $RunRoot 'fixture-modes.yaml'
+        $entries = foreach ($m in @(@('ParamFixture', 'parameter'), @('PrefFixture', 'preference'), @('NoneFixture', 'none'))) {
+            "  - name: $($m[0])`n    url: https://example.invalid/x.git`n    default_branch: main`n    build_script: true`n    result_file: $($m[1])`n    expect:`n      expected_failures: 1`n      reason: the fixture fails one test on purpose"
+        }
+        Set-Content -LiteralPath $yaml -Value ("requirements:`n  pester: '$pester'`nchildren:`n" + ($entries -join "`n"))
+        $modesRoot = Join-Path $RunRoot 'framework-root-modes'
+        $rows = @(Invoke-FrameworkTest -Manifest (Get-FrameworkManifest $yaml) -ReposRoot $childRepos -FrameworkRoot $modesRoot -Only ParamFixture, PrefFixture, NoneFixture | Where-Object Result -ne 'skipped (-Only)')
+        $by = @{}; $rows | ForEach-Object { $by[$_.Name] = $_ }
+        $run = @(Get-ChildItem (Join-Path $modesRoot '.framework' 'test-runs') -Directory)[0].FullName
+    }
+
+    It 'each of the three modes produces a row with counts' {
+        $rows.Count | Should -Be 3
+        foreach ($n in 'ParamFixture', 'PrefFixture', 'NoneFixture') {
+            $by[$n].Result | Should -Be 'pass-with-known'
+            $by[$n].Passed, $by[$n].Failed, $by[$n].Skipped | Should -Be @(2, 1, 1)
+        }
+    }
+
+    It 'parameter: the build that refuses foreign keys receives only TestResult, and no $PesterPreference' {
+        $keys, $sub, $pref = (Get-Content -LiteralPath (Join-Path $paramChild 'received.txt')) -split '\|'
+        $keys | Should -Be 'TestResult'
+        $sub | Should -Be 'Enabled,OutputFormat,OutputPath'
+        $pref | Should -Be 'False'
+        Join-Path $run 'ParamFixture.xml' | Should -Exist
+        Join-Path $run 'ParamFixture.junit.xml' | Should -Not -Exist
+        $by['ParamFixture'].Note | Should -Not -Match 'counts from output'
+    }
+
+    It 'preference: keeps the .junit.xml file name' {
+        Join-Path $run 'PrefFixture.junit.xml' | Should -Exist
+    }
+
+    It 'none: counts come from the printed summary and the row says so' {
+        Get-ChildItem -LiteralPath $run -Filter 'NoneFixture*.xml' | Should -BeNullOrEmpty
+        $by['NoneFixture'].Note | Should -Match 'counts from output'
+    }
+
+    It 'a result file Pester left unfinished gives a row with counts from output, not an error' {
+        # Pester's JUnit writer can stop mid-file (an 0x1B in a failure message); the fixture truncates it the same way.
+        $null = New-FixtureChild 'TruncFixture' @'
+param([hashtable]$PesterConfiguration = @{})
+task Test {
+    $config = New-PesterConfiguration -Hashtable $PesterConfiguration
+    $config.Run.Path = Join-Path $BuildRoot 'tests'
+    $config.Run.PassThru = $true
+    $r = Invoke-Pester -Configuration $config
+    $out = $config.TestResult.OutputPath.Value
+    Set-Content -LiteralPath $out -Value ((Get-Content -LiteralPath $out -Raw).Substring(0, 400) + '<failure message="')
+    if ($r.FailedCount) { throw "$($r.FailedCount) failed" }
+}
+'@
+        $truncYaml = Join-Path $RunRoot 'fixture-trunc.yaml'
+        Set-Content -LiteralPath $truncYaml -Value "requirements:`n  pester: '$pester'`nchildren:`n  - name: TruncFixture`n    url: u`n    default_branch: main`n    build_script: true`n    result_file: parameter`n    expect:`n      expected_failures: 1`n      reason: the fixture fails one test on purpose"
+        $r = @(Invoke-FrameworkTest -Manifest (Get-FrameworkManifest $truncYaml) -ReposRoot $childRepos -FrameworkRoot (Join-Path $RunRoot 'framework-root-trunc') -Only TruncFixture | Where-Object Result -ne 'skipped (-Only)')
+        $r.Count | Should -Be 1
+        $r[0].Result | Should -Be 'pass-with-known'
+        $r[0].Passed, $r[0].Failed, $r[0].Skipped | Should -Be @(2, 1, 1)
+        $r[0].Note | Should -Match 'TruncFixture\.xml unreadable; counts from output'
+    }
+}
+
+Describe 'Test -Only, the run record and Status TestedAt' {
+    BeforeAll {
+        $pester = [string](Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Requirements.pester
+        $childRepos = Join-Path $RunRoot 'children-only'
+
+        # A committed repo with a trivial build: one passing test, so a run takes seconds and needs no network.
+        function New-CommittedChild {
+            param([string]$Name)
+            $path = Join-Path $childRepos $Name
+            $null = New-Item -ItemType Directory -Path (Join-Path $path 'tests') -Force
+            G $path init --quiet --initial-branch=main | Out-Null
+            Set-Content -LiteralPath (Join-Path $path "$Name.build.ps1") -Value @'
+task Test {
+    $config = New-PesterConfiguration
+    $config.Run.Path = Join-Path $BuildRoot 'tests'
+    $config.Run.PassThru = $true
+    $r = Invoke-Pester -Configuration $config
+    if ($r.FailedCount) { throw "$($r.FailedCount) failed" }
+}
+'@
+            Set-Content -LiteralPath (Join-Path $path 'tests' "$Name.Tests.ps1") -Value "Describe 'fixture' { It 'passes' { 1 | Should -Be 1 } }"
+            G $path add -A | Out-Null
+            G $path commit --quiet -m 'fixture' | Out-Null
+            $path
+        }
+        $portal = New-CommittedChild 'Portal'
+        $null = New-CommittedChild 'Other'
+
+        $yaml = Join-Path $RunRoot 'fixture-only.yaml'
+        $entries = foreach ($n in 'Portal', 'Other') { "  - name: $n`n    url: https://example.invalid/$n.git`n    default_branch: main`n    build_script: true`n    result_file: preference" }
+        $entries += "  - name: Plain`n    url: https://example.invalid/Plain.git`n    default_branch: main`n    build_script: false"
+        Set-Content -LiteralPath $yaml -Value ("requirements:`n  pester: '$pester'`nchildren:`n" + ($entries -join "`n"))
+        $manifest = Get-FrameworkManifest $yaml
+
+        $root = Join-Path $RunRoot 'framework-root-only'
+        $runs = Join-Path $root '.framework' 'test-runs'
+        $rows = @(Invoke-FrameworkTest -Manifest $manifest -ReposRoot $childRepos -FrameworkRoot $root -Only Portal)
+        $by = @{}; $rows | ForEach-Object { $by[$_.Name] = $_ }
+        $run = @(Get-ChildItem -LiteralPath $runs -Directory)[0].FullName
+        $head = Get-Head $portal
+    }
+
+    It '-Only Portal runs one child and lists the rest as skipped (-Only)' {
+        $rows.Name | Should -Be @('Portal', 'Other', 'Plain', 'Claude.Framework')
+        $by['Portal'].Result | Should -Be 'pass'
+        $by['Other'].Result | Should -Be 'skipped (-Only)'
+        $by['Claude.Framework'].Result | Should -Be 'skipped (-Only)'
+        $by['Plain'].Result | Should -Be 'no build script'
+        Join-Path $run 'Portal.log' | Should -Exist
+        Join-Path $run 'Other.log' | Should -Not -Exist
+        Join-Path $run 'Other.result.json' | Should -Not -Exist
+    }
+
+    It '-Only Nope fails before running anything and lists the valid names' {
+        $nopeRoot = Join-Path $RunRoot 'framework-root-nope'
+        { Invoke-FrameworkTest -Manifest $manifest -ReposRoot $childRepos -FrameworkRoot $nopeRoot -Only Portal, Nope } |
+            Should -Throw '*Nope*Valid names: Portal, Other, Plain, Claude.Framework*'
+        Join-Path $nopeRoot '.framework' | Should -Not -Exist
+    }
+
+    It 'the run record carries commit, dirty, branch, tested_at and task' {
+        $file = Join-Path $run 'Portal.result.json'
+        $file | Should -Exist
+        $raw = Get-Content -LiteralPath $file -Raw
+        $rec = $raw | ConvertFrom-Json
+        $rec.commit | Should -Be $head
+        $rec.dirty | Should -BeFalse
+        $rec.branch | Should -Be 'main'
+        $rec.task | Should -Be 'Test'
+        # ConvertFrom-Json turns the timestamp into a DateTime, so the offset is checked in the text.
+        $raw | Should -Match '"tested_at":\s*"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d"'
+        $rec.result | Should -Be 'pass'
+        $rec.expected.failures | Should -Be 0
+        $rec.actual.passed, $rec.actual.failed, $rec.actual.skipped | Should -Be @(1, 0, 0)
+        $rec.verify | Should -Be 'not applicable'
+        $by['Portal'].Commit | Should -Be $head.Substring(0, 7)
+    }
+
+    It 'a dirty child is recorded dirty and its Commit ends in *' {
+        Set-Content -LiteralPath (Join-Path $portal 'untracked.txt') -Value x
+        $again = @(Invoke-FrameworkTest -Manifest $manifest -ReposRoot $childRepos -FrameworkRoot $root -Only Portal)
+        $again[0].Commit | Should -Be ($head.Substring(0, 7) + '*')
+        $newest = @(Get-ChildItem -LiteralPath $runs -Directory | Sort-Object Name -Descending)[0].FullName
+        (Get-Content -LiteralPath (Join-Path $newest 'Portal.result.json') -Raw | ConvertFrom-Json).dirty | Should -BeTrue
+    }
+
+    It 'Status shows the tested hash, then "stale" once HEAD moves, and "-" with no record' {
+        $s = @{}; Get-FrameworkStatus -Manifest $manifest -ReposRoot $childRepos -RunsRoot $runs | ForEach-Object { $s[$_.Name] = $_ }
+        $s['Portal'].TestedAt | Should -Be $head.Substring(0, 7)
+        $s['Other'].TestedAt | Should -Be '-'
+
+        Set-Content -LiteralPath (Join-Path $portal 'next.md') -Value x
+        G $portal add -- next.md | Out-Null
+        G $portal commit --quiet -m next | Out-Null
+        $s = @{}; Get-FrameworkStatus -Manifest $manifest -ReposRoot $childRepos -RunsRoot $runs | ForEach-Object { $s[$_.Name] = $_ }
+        $s['Portal'].TestedAt | Should -Be "$($head.Substring(0, 7)) stale"
+        $s['Other'].TestedAt | Should -Be '-'
+    }
+}
+
+Describe 'Test -Full plans full_test_task where declared' {
+    It 'picks TestFull for Claude.Ontology with -Full, test_task elsewhere, and Test without -Full' {
+        $manifest = Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')
+        $plain = @{}; Get-FrameworkTestPlan -Manifest $manifest | ForEach-Object { $plain[$_.Name] = $_.Task }
+        $full = @{}; Get-FrameworkTestPlan -Manifest $manifest -Full | ForEach-Object { $full[$_.Name] = $_.Task }
+
+        $plain['Claude.Ontology'] | Should -Be 'Test'
+        $full['Claude.Ontology'] | Should -Be 'TestFull'
+        foreach ($n in 'Claude.Chain', 'Claude.Skills', 'Claude.Portal') {
+            $plain[$n] | Should -Be 'Test'
+            $full[$n] | Should -Be 'Test'
+        }
+        foreach ($n in 'Claude.Root', 'Claude.Substrate', 'Claude.Modules') { $full[$n] | Should -BeNullOrEmpty }
+        $full['Claude.Framework'] | Should -Be 'SelfTest'
+    }
+
+    It 'uses a declared test_task when no full_test_task is declared' {
+        $yaml = Join-Path $RunRoot 'fixture-plan.yaml'
+        Set-Content -LiteralPath $yaml -Value "requirements: {}`nchildren:`n  - name: X`n    url: u`n    default_branch: main`n    build_script: true`n    result_file: none`n    expect:`n      test_task: Check"
+        (Get-FrameworkTestPlan -Manifest (Get-FrameworkManifest $yaml) -Full)[0].Task | Should -Be 'Check'
+    }
+}
+
+Describe 'Requirements: CLAUDE_CHAIN_LEDGER and Invoke-Build' {
+    BeforeAll {
+        $manifest = Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')
+        $savedLedger = $env:CLAUDE_CHAIN_LEDGER
+        function Get-Row { param([string]$Name) Test-FrameworkRequirements -Manifest $manifest | Where-Object Requirement -eq $Name }
+    }
+    AfterAll { $env:CLAUDE_CHAIN_LEDGER = $savedLedger }
+
+    It 'CLAUDE_CHAIN_LEDGER unset: Found (unset), Ok false' {
+        $env:CLAUDE_CHAIN_LEDGER = $null
+        $r = Get-Row 'CLAUDE_CHAIN_LEDGER'
+        $r.Wanted | Should -Be 'file exists'
+        $r.Found | Should -Be '(unset)'
+        $r.Ok | Should -BeFalse
+    }
+
+    It 'CLAUDE_CHAIN_LEDGER pointing at a missing path: Found shows it, Ok false' {
+        $missing = Join-Path $RunRoot 'no-such-ledger.jsonl'
+        $env:CLAUDE_CHAIN_LEDGER = $missing
+        $r = Get-Row 'CLAUDE_CHAIN_LEDGER'
+        $r.Found | Should -Be $missing
+        $r.Ok | Should -BeFalse
+    }
+
+    It 'CLAUDE_CHAIN_LEDGER pointing at a file: Ok true' {
+        $file = Join-Path $RunRoot 'ledger.jsonl'
+        Set-Content -LiteralPath $file -Value '{}'
+        $env:CLAUDE_CHAIN_LEDGER = $file
+        (Get-Row 'CLAUDE_CHAIN_LEDGER').Ok | Should -BeTrue
+    }
+
+    It 'Invoke-Build is importable in this process' {
+        $r = Get-Row 'Invoke-Build'
+        $r.Wanted | Should -Be 'present'
+        $r.Found | Should -Not -Be 'missing'
+        $r.Ok | Should -BeTrue
+    }
+}
+
+Describe 'the Ontology rename' {
+    It 'no file outside repos\ contains the old workspace header' {
+        # Built in two parts so this file does not match itself. .framework/test-runs is skipped: it holds child
+        # output, and Claude.Ontology's own tests name the old header as the foreign one.
+        $needle = 'WORKSPACE: ' + 'plugins'
+        $runsDir = Join-Path $FrameworkRoot '.framework' 'test-runs'
+        $files = Get-ChildItem -LiteralPath $FrameworkRoot -Force | Where-Object Name -notin 'repos', '.git' | ForEach-Object {
+            if ($_.PSIsContainer) { Get-ChildItem -LiteralPath $_.FullName -Recurse -File -Force } else { $_ }
+        } | Where-Object { -not $_.FullName.StartsWith($runsDir, [StringComparison]::OrdinalIgnoreCase) }
+        $files | Should -Not -BeNullOrEmpty
+        $hits = @($files | Select-String -SimpleMatch -Pattern $needle -List | ForEach-Object Path)
+        $hits | Should -BeNullOrEmpty
     }
 }
 
