@@ -105,7 +105,7 @@ children:
 # that child is on its expected branch.
 # Each getter ends ok, failed, refused or skipped. Refused is a non-zero exit whose last printed line begins "refused".
 # The verdict line is the first line of {out}/verdict.txt, else the last line the entry printed.
-# Shape and Secrets are promoted (Claude.Modules); the others are entry: none with no path until they are.
+# Shape, Secrets and Coverage are promoted (Claude.Modules); the others are entry: none with no path until they are.
 
 getters:
   - name: Catalogue
@@ -153,13 +153,19 @@ getters:
     cadence: every
     order: 50
 
+  # -Graph is not passed: it defaults to {out}\..\Shape\graph.json, the sibling folder Heartbeat gives Shape.
   - name: Coverage
-    entry: none
+    path: Claude.Modules
+    entry:
+      script: tools/Get-FrameworkCoverage.ps1
+      parameters:
+        Root: '{framework_root}'
+        Out: '{out}'
+    outputs: [coverage.json, coverage.md]
     needs: [Shape]
     tests: false
     cadence: every
     order: 60
-    note: not promoted to repos/ yet
 
   - name: Diff
     entry: none

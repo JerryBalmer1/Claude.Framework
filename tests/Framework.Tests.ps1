@@ -158,10 +158,10 @@ Describe 'framework.yaml getters' {
         $ok = "  - name: A`n    path: getters/A`n    entry:`n      script: tools/Run.ps1`n    cadence: every`n    order: 1"
     }
 
-    It 'registers seven getters, Diff last; all but Shape and Secrets are entry: none, no path, not promoted yet' {
+    It 'registers seven getters, Diff last; all but Shape, Secrets and Coverage are entry: none, no path, not promoted yet' {
         $g = (Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Getters
         $g.Name | Should -Be @('Catalogue', 'Hardening', 'Incidents', 'Shape', 'Secrets', 'Coverage', 'Diff')
-        foreach ($x in @($g | Where-Object Name -notin 'Shape', 'Secrets')) {
+        foreach ($x in @($g | Where-Object Name -notin 'Shape', 'Secrets', 'Coverage')) {
             $x.Entry | Should -BeNullOrEmpty
             $x.Path | Should -BeNullOrEmpty
             $x.Note | Should -Be 'not promoted to repos/ yet'
@@ -178,6 +178,19 @@ Describe 'framework.yaml getters' {
         $s.Outputs | Should -Be @('findings.json', 'summary.md')
         $s.Order | Should -Be 50
         $s.Cadence | Should -Be 'every'
+    }
+
+    It 'Coverage runs Claude.Modules tools/Get-FrameworkCoverage.ps1 with -Root and -Out, no -Graph, order 60, every, needing Shape' {
+        $s = (Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Getters | Where-Object Name -eq 'Coverage'
+        $s.Path | Should -Be 'Claude.Modules'
+        $s.Entry.Script | Should -Be 'tools/Get-FrameworkCoverage.ps1'
+        @($s.Entry.Parameters.Keys | Sort-Object) | Should -Be @('Out', 'Root')
+        $s.Entry.Parameters.Root | Should -Be '{framework_root}'
+        $s.Entry.Parameters.Out | Should -Be '{out}'
+        $s.Outputs | Should -Be @('coverage.json', 'coverage.md')
+        $s.Order | Should -Be 60
+        $s.Cadence | Should -Be 'every'
+        $s.Needs | Should -Be @('Shape')
     }
 
     It 'Shape runs Claude.Modules tools/Get-FrameworkShape.ps1 with -Root and -Out, order 40, every, needing nothing' {
