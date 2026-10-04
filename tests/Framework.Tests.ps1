@@ -158,14 +158,36 @@ Describe 'framework.yaml getters' {
         $ok = "  - name: A`n    path: getters/A`n    entry:`n      script: tools/Run.ps1`n    cadence: every`n    order: 1"
     }
 
-    It 'registers seven getters, Diff last; all but Shape, Secrets, Coverage and Diff are entry: none, no path, not promoted yet' {
+    It 'registers ten getters, Diff last; Catalogue, Hardening and Incidents are entry: none, no path, not promoted yet' {
         $g = (Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Getters
-        $g.Name | Should -Be @('Catalogue', 'Hardening', 'Incidents', 'Shape', 'Secrets', 'Coverage', 'Diff')
-        foreach ($x in @($g | Where-Object Name -notin 'Shape', 'Secrets', 'Coverage', 'Diff')) {
+        $g.Name | Should -Be @('Dirty', 'Catalogue', 'Signs', 'Hardening', 'Incidents', 'Shape', 'Secrets', 'Coverage', 'Refusals', 'Diff')
+        foreach ($x in @($g | Where-Object Name -in 'Catalogue', 'Hardening', 'Incidents')) {
             $x.Entry | Should -BeNullOrEmpty
             $x.Path | Should -BeNullOrEmpty
             $x.Note | Should -Be 'not promoted to repos/ yet'
         }
+    }
+
+    It '<Name> runs Claude.Modules tools/Get-Framework<Name>.ps1 with -Root and -Out, order <Order>, every, needing nothing' -ForEach @(
+        @{ Name = 'Dirty'; Order = 10; Outputs = @('dirty.json', 'dirty.md') }
+        @{ Name = 'Signs'; Order = 20; Outputs = @('signs.json', 'signs.md') }
+        @{ Name = 'Refusals'; Order = 80; Outputs = @('refusals.json', 'refusals.md') }
+    ) {
+        $s = (Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Getters | Where-Object Name -eq $Name
+        $s.Path | Should -Be 'Claude.Modules'
+        $s.Entry.Script | Should -Be "tools/Get-Framework$Name.ps1"
+        @($s.Entry.Parameters.Keys | Sort-Object) | Should -Be @('Out', 'Root')
+        $s.Entry.Parameters.Root | Should -Be '{framework_root}'
+        $s.Entry.Parameters.Out | Should -Be '{out}'
+        $s.Outputs | Should -Be $Outputs
+        $s.Order | Should -Be $Order
+        $s.Cadence | Should -Be 'every'
+        @($s.Needs).Count | Should -Be 0
+    }
+
+    It 'the runnable getters run Dirty, Signs, Shape, Secrets, Coverage, Refusals, Diff' {
+        $g = (Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Getters
+        @(Get-FrameworkGetterOrder $g | Where-Object Entry).Name | Should -Be @('Dirty', 'Signs', 'Shape', 'Secrets', 'Coverage', 'Refusals', 'Diff')
     }
 
     It 'Secrets runs Claude.Modules tools/Find-FrameworkSecret.ps1 with -Root and -Out, order 50, every' {
@@ -1313,6 +1335,41 @@ getters:
         $o = Get-FrameworkGetterOutcomes $root
         $o.Ok | Should -Be 2
         $o.Call | Should -Be 'mixed'
+    }
+
+    It 'Status prints one verdict row per getter from the newest heartbeat''s result.json files, seven for seven' {
+        $root = Join-Path $RunRoot 'verdict-rows'
+        $old = Join-Path $root '20260101-000000-001'
+        $hb = Join-Path $root '20260102-000000-001'
+        $null = New-Item -ItemType Directory -Path $old, $hb -Force
+        Set-Content -LiteralPath (Join-Path $old 'heartbeat.json') -Value (@{ getters = @(@{ name = 'Shape'; result = 'ok' }) } | ConvertTo-Json -Depth 4)
+        $rows = [ordered]@{
+            Dirty    = @{ result = 'ok'; verdict = '7 checkouts, 0 dirty: ok' }
+            Signs    = @{ result = 'ok'; verdict = '12 signs, 0 missing: ok' }
+            Shape    = @{ result = 'ok'; verdict = '7 repos, 40 edges' }
+            Secrets  = @{ result = 'ok'; verdict = '0 findings' }
+            Coverage = @{ result = 'failed'; verdict = '3 of 7 covered'; note = 'exit 1' }
+            Refusals = @{ result = 'refused'; verdict = 'refused: no heartbeats folder' }
+            Diff     = @{ result = 'skipped'; verdict = $null; note = 'needs Shape' }
+        }
+        foreach ($n in $rows.Keys) { Set-Content -LiteralPath (Join-Path $hb "$n.result.json") -Value (([ordered]@{ name = $n } + $rows[$n]) | ConvertTo-Json) }
+        Set-Content -LiteralPath (Join-Path $hb 'heartbeat.json') -Value (@{
+                getters = @($rows.Keys | ForEach-Object { @{ name = $_; result = $rows[$_].result } })
+                diff    = '1 better, 0 worse, 0 unknown: improved'
+            } | ConvertTo-Json -Depth 4)
+        $lines = @(Format-FrameworkGetterStatus $root)
+        $lines[0] | Should -Be 'Getters (heartbeat 20260102-000000-001): ok 4, failed 1, refused 1, skipped 1; diff improved'
+        $verdicts = @($lines | Select-Object -Skip 1)
+        $verdicts.Count | Should -Be 7
+        $names = @($rows.Keys)
+        for ($i = 0; $i -lt 7; $i++) { $verdicts[$i] | Should -Match "^\s+$($names[$i])\s+$($rows[$names[$i]].result)\s+" }
+        $verdicts[0] | Should -Match '7 checkouts, 0 dirty: ok$'
+        $verdicts[5] | Should -Match 'refused: no heartbeats folder$'
+        $verdicts[6] | Should -Match 'needs Shape$'
+    }
+
+    It 'Status says no heartbeat yet when there is none' {
+        Format-FrameworkGetterStatus (Join-Path $RunRoot 'no-heartbeats') | Should -Be 'Getters: no heartbeat yet'
     }
 }
 

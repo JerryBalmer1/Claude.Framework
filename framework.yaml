@@ -105,22 +105,48 @@ children:
 # that child is on its expected branch.
 # Each getter ends ok, failed, refused or skipped. Refused is a non-zero exit whose last printed line begins "refused".
 # The verdict line is the first line of {out}/verdict.txt, else the last line the entry printed.
-# Shape, Secrets, Coverage and Diff are promoted (Claude.Modules); the others are entry: none with no path until they are.
-# Diff is the only getter that reads earlier heartbeats, and it is always last.
+# Dirty, Signs, Shape, Secrets, Coverage, Refusals and Diff are promoted (Claude.Modules); the others are entry: none
+# with no path until they are. Dirty runs first: it grades whether the checkouts are fit to be graded at all.
+# Refusals and Diff read earlier heartbeats. Refusals reads their heartbeat.json files; the current heartbeat's is not
+# written until every getter has run, so it never reads its own. Diff is always last.
 
 getters:
+  - name: Dirty
+    path: Claude.Modules
+    entry:
+      script: tools/Get-FrameworkDirty.ps1
+      parameters:
+        Root: '{framework_root}'
+        Out: '{out}'
+    outputs: [dirty.json, dirty.md]
+    tests: false
+    cadence: every
+    order: 10
+
   - name: Catalogue
     entry: none
     tests: false
     cadence: every
-    order: 10
+    order: 15
     note: not promoted to repos/ yet
+
+  - name: Signs
+    path: Claude.Modules
+    entry:
+      script: tools/Get-FrameworkSigns.ps1
+      parameters:
+        Root: '{framework_root}'
+        Out: '{out}'
+    outputs: [signs.json, signs.md]
+    tests: false
+    cadence: every
+    order: 20
 
   - name: Hardening
     entry: none
     tests: false
     cadence: every
-    order: 20
+    order: 25
     note: not promoted to repos/ yet
 
   - name: Incidents
@@ -167,6 +193,20 @@ getters:
     tests: false
     cadence: every
     order: 60
+
+  # -Heartbeats is not passed: it defaults to {framework_root}\.framework\heartbeats. The heartbeat Refusals runs inside
+  # has no heartbeat.json yet, so Refusals reads only earlier ones.
+  - name: Refusals
+    path: Claude.Modules
+    entry:
+      script: tools/Get-FrameworkRefusals.ps1
+      parameters:
+        Root: '{framework_root}'
+        Out: '{out}'
+    outputs: [refusals.json, refusals.md]
+    tests: false
+    cadence: every
+    order: 80
 
   # -Before and -After are not passed: -After defaults to {out}\.., the heartbeat Diff runs inside, and -Before to the
   # newest older heartbeat beside it that holds a heartbeat.json. With none, Diff refuses (a refused outcome, not failed).

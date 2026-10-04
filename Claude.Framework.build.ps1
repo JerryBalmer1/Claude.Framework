@@ -15,7 +15,8 @@
     Status        prints branch (with "(expected <x>)" when it differs from framework.yaml), ahead/behind, dirty count, last commit, build script and TestedAt per child.
                   TestedAt is the commit of the newest run record, with 'stale' when HEAD has moved since. Then how many
                   getters in the newest heartbeat ended ok, failed, refused and skipped, with Diff's call beside them
-                  when that heartbeat has one.
+                  when that heartbeat has one, then one row per getter: its outcome and the verdict line from its
+                  <Getter>.result.json (the note when it left none).
     Test          runs each child's test_task (default Test; full_test_task with -Full, where declared) in a fresh
                   pwsh in its folder (tasks_before_test first), then SelfTest the same way; prints actual against
                   the expect block in framework.yaml, with the commit tested (* when dirty). A child's verify is
@@ -93,9 +94,7 @@ task Sync $SyncJob
 task Status {
     Get-FrameworkStatus -Manifest (Get-FrameworkManifest $ManifestPath) -ReposRoot $ReposRoot -RunsRoot (Join-Path $BuildRoot '.framework' 'test-runs') |
         Format-Table -AutoSize | Out-String -Width 200
-    $o = Get-FrameworkGetterOutcomes (Join-Path $BuildRoot '.framework' 'heartbeats')
-    if ($o) { print Cyan "Getters (heartbeat $($o.Stamp)): ok $($o.Ok), failed $($o.Failed), refused $($o.Refused), skipped $($o.Skipped)$(if ($o.Call) { "; diff $($o.Call)" })" }
-    else { print Cyan 'Getters: no heartbeat yet' }
+    Format-FrameworkGetterStatus (Join-Path $BuildRoot '.framework' 'heartbeats') | ForEach-Object { print Cyan $_ }
 }
 
 task Test {

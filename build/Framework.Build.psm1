@@ -206,13 +206,22 @@ function Get-GetterOutcome {
 function Get-FrameworkGetterOutcomes {
     # How many getters in the newest heartbeat.json under $HeartbeatsRoot ended ok, failed, refused and skipped,
     # with that heartbeat's stamp and Diff's call (improved, regressed, mixed or unchanged) when its diff verdict reads
-    # "N better, N worse, N unknown: <call>", else $null; $null when there is no heartbeat.
+    # "N better, N worse, N unknown: <call>", else $null; $null when there is no heartbeat. Rows holds one entry per
+    # getter in heartbeat.json order (Name, Result, Verdict), read from that heartbeat's <Getter>.result.json, with the
+    # note standing in for a getter that left no verdict line.
     param([string]$HeartbeatsRoot)
     foreach ($f in Get-StampFolders $HeartbeatsRoot) {
         $file = Join-Path $f.FullName 'heartbeat.json'
         if (-not (Test-Path -LiteralPath $file)) { continue }
         $hb = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
         $results = @($hb.getters | ForEach-Object { Get-GetterOutcome $_.result })
+        $rows = @(foreach ($g in @($hb.getters)) {
+                $rf = Join-Path $f.FullName "$($g.name).result.json"
+                if (-not (Test-Path -LiteralPath $rf)) { [pscustomobject]@{ Name = $g.name; Result = Get-GetterOutcome $g.result; Verdict = 'no result.json' }; continue }
+                $r = Get-Content -LiteralPath $rf -Raw | ConvertFrom-Json
+                $verdict = if ("$($r.verdict)") { "$($r.verdict)" } elseif ("$($r.note)") { "$($r.note)" } else { '-' }
+                [pscustomobject]@{ Name = $g.name; Result = Get-GetterOutcome $r.result; Verdict = $verdict }
+            })
         return [pscustomobject]@{
             Stamp   = $f.Name
             Ok      = @($results | Where-Object { $_ -eq 'ok' }).Count
@@ -220,9 +229,21 @@ function Get-FrameworkGetterOutcomes {
             Refused = @($results | Where-Object { $_ -eq 'refused' }).Count
             Skipped = @($results | Where-Object { $_ -eq 'skipped' }).Count
             Call    = if ("$($hb.diff)" -match '^\d+ better, \d+ worse, \d+ unknown: (\S+)$') { $Matches[1] }
+            Rows    = $rows
         }
     }
     $null
+}
+
+function Format-FrameworkGetterStatus {
+    # The getter lines Status prints: the outcome counts with Diff's call, then one verdict row per getter in the
+    # newest heartbeat, so one Status call reads every getter. 'Getters: no heartbeat yet' when there is none.
+    param([string]$HeartbeatsRoot)
+    $o = Get-FrameworkGetterOutcomes $HeartbeatsRoot
+    if (-not $o) { return 'Getters: no heartbeat yet' }
+    "Getters (heartbeat $($o.Stamp)): ok $($o.Ok), failed $($o.Failed), refused $($o.Refused), skipped $($o.Skipped)$(if ($o.Call) { "; diff $($o.Call)" })"
+    $nameWidth = (@($o.Rows | ForEach-Object { "$($_.Name)".Length }) + 4 | Measure-Object -Maximum).Maximum
+    foreach ($r in $o.Rows) { "  $("$($r.Name)".PadRight($nameWidth))  $("$($r.Result)".PadRight(7))  $($r.Verdict)" }
 }
 
 function Expand-FrameworkPlaceholder {
@@ -1356,4 +1377,4 @@ function Invoke-FrameworkBootstrap {
 Export-ModuleMember -Function Get-FrameworkManifest, Test-FrameworkRequirements, Sync-Framework, Sync-FrameworkChild,
     Get-FrameworkStatus, Get-FrameworkTestPlan, Get-FrameworkBranchCheck, Invoke-FrameworkTest, Invoke-ChildTask, Invoke-ChildVerify, Get-TestVerdict,
     New-FrameworkRunFolder, Invoke-FrameworkBootstrap, Invoke-FrameworkHeartbeat, Resolve-FrameworkEnv, Get-HeartbeatReusedRun,
-    Get-FrameworkGetterOrder, Get-FrameworkGetterOutcomes
+    Get-FrameworkGetterOrder, Get-FrameworkGetterOutcomes, Format-FrameworkGetterStatus
