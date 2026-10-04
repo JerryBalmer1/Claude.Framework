@@ -90,14 +90,14 @@ function ConvertTo-FrameworkGetter {
     # One getters entry. name, order, cadence and entry are required; path is required unless entry is none.
     # path is relative to repos/ (CLAUDE.md: a getter runs only from under repos/), so it may not be rooted or climb.
     # entry is none, or a mapping: script (a .ps1 under tools/) and optional parameters, whose values may hold
-    # {out}, {previous}, {framework_root} and {repos_root}.
+    # {out}, {previous}, {framework_root} and {repos_root}. outputs lists file names the entry must leave under {out}.
     param($Block)
     if ($Block -isnot [System.Collections.IDictionary]) { throw "Manifest getters: each entry must be a mapping." }
     $name = $Block['name']
     foreach ($field in 'name', 'order', 'cadence', 'entry') {
         if (-not $Block.Contains($field) -or $null -eq $Block[$field] -or "$($Block[$field])" -eq '') { throw "Manifest getter '$name' is missing '$field'." }
     }
-    $unknown = @($Block.Keys | Where-Object { $_ -notin 'name', 'path', 'entry', 'tests', 'expects', 'cadence', 'order', 'note' })
+    $unknown = @($Block.Keys | Where-Object { $_ -notin 'name', 'path', 'entry', 'tests', 'expects', 'outputs', 'cadence', 'order', 'note' })
     if ($unknown) { throw "Manifest getter '$name': unknown key(s) $($unknown -join ', ')." }
     if (($Block.order -isnot [int] -and $Block.order -isnot [long]) -or $Block.order -lt 0) { throw "Manifest getter '$name': order must be a whole number >= 0." }
     if ("$($Block.cadence)" -notin 'every', 'weekly') { throw "Manifest getter '$name': cadence must be every or weekly, not '$($Block.cadence)'." }
@@ -124,6 +124,10 @@ function ConvertTo-FrameworkGetter {
         if ($Block.tests -isnot [bool]) { throw "Manifest getter '$name': tests must be true or false." }
         $tests = $Block.tests
     }
+    $outputs = @(foreach ($o in @($Block['outputs'] | Where-Object { $null -ne $_ })) {
+            if ($o -isnot [string] -or -not (Test-RelativePath $o)) { throw "Manifest getter '$name': each output must be a file name relative to {out}, not '$o'." }
+            $o
+        })
     if ($null -ne $Block['expects']) {
         if ($Block.expects -isnot [System.Collections.IDictionary]) { throw "Manifest getter '$name': expects must be a mapping." }
         $bad = @($Block.expects.Keys | Where-Object { $_ -notin 'expected_failures', 'no_tests', 'reason' })
@@ -134,6 +138,7 @@ function ConvertTo-FrameworkGetter {
         Path    = if ($null -ne $path) { [string]$path }
         Entry   = $entry
         Tests   = $tests
+        Outputs = $outputs
         Expect  = ConvertTo-ChildExpectation -Name $name -Block $Block['expects']
         Cadence = [string]$Block.cadence
         Order   = [int]$Block.order
@@ -232,10 +237,12 @@ function Get-FrameworkManifest {
             }
         }
         if ($c.build_script -isnot [bool]) { throw "Manifest entry '$($c.name)': build_script must be true or false." }
+        if ($c.ContainsKey('branch') -and ($c.branch -isnot [string] -or -not $c.branch)) { throw "Manifest entry '$($c.name)': branch must be a branch name." }
         [pscustomobject]@{
             Name          = [string]$c.name
             Url           = [string]$c.url
             DefaultBranch = [string]$c.default_branch
+            Branch        = if ($c.ContainsKey('branch')) { [string]$c.branch } else { [string]$c.default_branch }
             BuildScript   = [bool]$c.build_script
             Expect        = ConvertTo-ChildExpectation -Name $c.name -Block $c['expect']
             Verify        = ConvertTo-ChildVerify -Name $c.name -Block $c['verify']
@@ -293,6 +300,14 @@ function Test-FrameworkRequirements {
     foreach ($e in @(Set-FrameworkEnv -Manifest $Manifest -FrameworkRoot $FrameworkRoot -ReposRoot $ReposRoot)) {
         $note = if ($null -eq $e.Previous -or $e.Previous -eq '') { 'shell unset' } elseif ($e.Previous -ne $e.Value) { "shell had $($e.Previous)" } else { '' }
         & $add $e.Name $e.Wanted $e.Value (Test-Path -LiteralPath $e.Value -PathType Leaf) $note
+    }
+
+    # Each cloned child must be on its expected branch; one on a trap or feature branch fails its row, naming the branch.
+    # A child not cloned yet passes (Sync clones it); Test and Status report it.
+    if (-not $ReposRoot) { $ReposRoot = Join-Path ($FrameworkRoot ? $FrameworkRoot : $Manifest.Root) 'repos' }
+    foreach ($b in @(Get-FrameworkBranchCheck -Manifest $Manifest -ReposRoot $ReposRoot)) {
+        $note = if ($null -eq $b.Actual) { 'not cloned' } elseif (-not $b.Ok) { "on $($b.Actual), expected $($b.Expected)" } else { '' }
+        & $add "$($b.Name) branch" $b.Expected ($b.Actual ?? 'not cloned') ($b.Ok -or $null -eq $b.Actual) $note
     }
 
     # Ok when this process can import the module, not merely when a copy is on disk.
@@ -418,6 +433,24 @@ function Get-ChildCheckout {
     }
 }
 
+function Get-FrameworkBranchCheck {
+    # One row per child: Name, Expected (the manifest's branch), Actual (the checked-out branch, '(detached)', or $null
+    # when not cloned) and Ok. Reads only; nothing is checked out.
+    param([Parameter(Mandatory)]$Manifest, [Parameter(Mandatory)][string]$ReposRoot)
+    foreach ($c in $Manifest.Children) {
+        $path = Join-Path $ReposRoot $c.Name
+        $actual = if (Test-Path -LiteralPath (Join-Path $path '.git')) { (Get-ChildCheckout $path).Branch }
+        [pscustomobject]@{ Name = $c.Name; Expected = $c.Branch; Actual = $actual; Ok = ($null -ne $actual -and $actual -eq $c.Branch) }
+    }
+}
+
+function Get-BranchRefusal {
+    # The note a run gives a child (or a getter rooted in one) whose checkout is not on its expected branch; $null when it is.
+    param([Parameter(Mandatory)]$Child, [Parameter(Mandatory)]$Checkout)
+    if ($Checkout.Branch -eq $Child.Branch) { return $null }
+    "on branch $($Checkout.Branch), expected $($Child.Branch); not run"
+}
+
 function Format-ShortCommit {
     # Seven characters of the hash, and a trailing * when the tree was dirty; '-' when there is no commit.
     param([string]$Commit, [bool]$Dirty)
@@ -454,6 +487,7 @@ function Get-FrameworkStatus {
         $head = Invoke-Git $path rev-parse --verify --quiet HEAD -AllowFail
         if ($testedAt -ne '-' -and ($head.ExitCode -ne 0 -or $record.commit -ne $head.Output[0])) { $testedAt += ' stale' }
         $branch = @(Invoke-Git $path rev-parse --abbrev-ref HEAD)[0]
+        if ($branch -ne $c.Branch) { $branch += " (expected $($c.Branch))" }
         $ahead = $behind = $null
         $counts = Invoke-Git $path rev-list --left-right --count 'HEAD...@{u}' -AllowFail
         if ($counts.ExitCode -eq 0) { $ahead, $behind = ($counts.Output[0] -split '\s+') | ForEach-Object { [int]$_ } }
@@ -516,11 +550,15 @@ function Invoke-ChildProcess {
         $saved[$k] = [Environment]::GetEnvironmentVariable($k)
         [Environment]::SetEnvironmentVariable($k, $Environment[$k])
     }
-    # A native command starts in the current FileSystem location.
+    # A native command starts in the current FileSystem location. The output is written to $LogFile only after the
+    # process exits: a log held open for writing cannot be read, and a getter (Secrets) scans the Framework root,
+    # .framework/ included, while it runs.
     Push-Location -LiteralPath $WorkingDirectory
     try {
-        & pwsh -NoProfile -NonInteractive -EncodedCommand $encoded *> $LogFile
-        $LASTEXITCODE
+        $output = & pwsh -NoProfile -NonInteractive -EncodedCommand $encoded *>&1
+        $code = $LASTEXITCODE
+        Set-Content -LiteralPath $LogFile -Value @($output | ForEach-Object { "$_" })
+        $code
     }
     finally {
         Pop-Location
@@ -797,6 +835,14 @@ function Invoke-FrameworkTest {
         # Taken before tasks_before_test, so an Install that writes into the tree does not mark the run dirty.
         $checkout = Get-ChildCheckout $path
         $testedAt = & $now
+        # A child on a trap or feature branch is never tested: the row fails and names the branch.
+        $refusal = Get-BranchRefusal $c $checkout
+        if ($refusal) {
+            $r = & $row $c.Name 'FAIL' $expected $null $verifyCol $null $refusal $task $checkout
+            Write-ChildRunRecord -RunFolder $run -Row $r -Checkout $checkout -TestedAt $testedAt -Expect $e -Env $envRecord -Partial $partial
+            $r
+            continue
+        }
         $sw = [Diagnostics.Stopwatch]::StartNew()
         $before = $null
         foreach ($t in $e.TasksBeforeTest) {
@@ -831,7 +877,7 @@ function Invoke-FrameworkTest {
         if ($verdict.Result -eq 'no-tests') {
             # The branch Sync left checked out, so the note cannot go stale the way a branch named in the reason did.
             $branch = $checkout.Branch
-            $note += "; checkout on $branch" + $(if ($branch -ne $c.DefaultBranch) { ", not default_branch $($c.DefaultBranch)" })
+            $note += "; checkout on $branch"
         }
         if ($p.Verify -eq 'run') {
             $v = Invoke-ChildVerify -Name $c.Name -Path $path -Verify $c.Verify -RunFolder $run
@@ -1018,9 +1064,11 @@ function Invoke-FrameworkHeartbeat {
         if (-not (& $selected $c.Name)) { & $vr 'skipped (-Only)' '-' $null $null; continue }
         $path = Join-Path $ReposRoot $c.Name
         if (-not (Test-Path -LiteralPath (Join-Path $path '.git'))) { & $vr 'not run' '-' $null 'not cloned; run Sync'; continue }
+        $checkout = Get-ChildCheckout $path
+        $refusal = Get-BranchRefusal $c $checkout
+        if ($refusal) { & $vr 'refused' (Format-ShortCommit $checkout.Commit $checkout.Dirty) $null $refusal; continue }
         $verifyRoot = Join-Path $folder 'verify'
         $null = New-Item -ItemType Directory -Path $verifyRoot -Force
-        $checkout = Get-ChildCheckout $path
         $sw = [Diagnostics.Stopwatch]::StartNew()
         $v = Invoke-ChildVerify -Name $c.Name -Path $path -Verify $c.Verify -RunFolder $verifyRoot
         $note = $v.Note
@@ -1074,10 +1122,14 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
         $sw = [Diagnostics.Stopwatch]::StartNew()
         $path = if ($g.Path) { Join-Path $ReposRoot $g.Path }
         $checkout = Get-CheckoutOrNone $path
-        $line = $null; $counts = $null; $seconds = $null
+        # A getter rooted in a child's folder runs only from that child's expected branch.
+        $owner = if ($g.Path) { $Manifest.Children | Where-Object Name -eq (@($g.Path -split '[\\/]')[0]) | Select-Object -First 1 }
+        $refusal = if ($owner -and $checkout) { Get-BranchRefusal $owner $checkout }
+        $line = $null; $counts = $null; $seconds = $null; $verdictLine = $null
         $result, $note = if (-not (& $selected $g.Name)) { 'skipped', '-Only' }
         elseif (-not $g.Entry) { 'not runnable', ((@('entry: none', $g.Note) | Where-Object { $_ }) -join '; ') }
         elseif (-not (Test-Path -LiteralPath $path -PathType Container)) { 'not runnable', "repos/$($g.Path) not found" }
+        elseif ($refusal) { 'fail', "$($owner.Name) $refusal" }
         elseif ($g.Cadence -eq 'weekly' -and $g.Name -notin @($Only) -and $lastRan.ContainsKey($g.Name) -and $lastRan[$g.Name] -gt [DateTimeOffset]::Now.AddDays(-7)) {
             'skipped', "weekly; last ran $($lastRan[$g.Name].ToString('yyyy-MM-dd HH:mm'))"
         }
@@ -1104,14 +1156,17 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
                 $verdict = Get-TestVerdict -ExitCode $texit -Counts $counts -Expect $g.Expect -TestFileCount $files
                 if ($verdict.Note) { $notes.Add("tests $($verdict.Result): $($verdict.Note)") }
             }
-            $result = if ($exit -ne 0 -or ($verdict -and $verdict.Result -eq 'FAIL')) { 'fail' } else { 'pass' }
+            $missing = @($g.Outputs | Where-Object { -not (Test-Path -LiteralPath (Join-Path $out $_) -PathType Leaf) })
+            if ($missing) { $notes.Add("missing output(s) under {out}: $($missing -join ', ')") }
+            $result = if ($exit -ne 0 -or $missing -or ($verdict -and $verdict.Result -eq 'FAIL')) { 'fail' } else { 'pass' }
+            # The verdict line: the first line of verdict.txt in the getter's output, else the last line it printed.
+            $vf = Join-Path $out 'verdict.txt'
+            $lines = if (Test-Path -LiteralPath $vf) { @(Get-Content -LiteralPath $vf) } else { @(Get-Content -LiteralPath (Join-Path $folder "$($g.Name).log") -ErrorAction SilentlyContinue) }
+            $lines = @($lines | Where-Object { "$_".Trim() })
+            $verdictLine = if ($lines) { if (Test-Path -LiteralPath $vf) { "$($lines[0])".Trim() } else { "$($lines[-1])".Trim() } }
             if ($g.Name -eq 'Diff') {
                 if (-not $previous) { $notes.Add('no previous heartbeat') }
-                # The first line of verdict.txt in Diff's output, else the last line Diff printed.
-                $vf = Join-Path $out 'verdict.txt'
-                $lines = if (Test-Path -LiteralPath $vf) { @(Get-Content -LiteralPath $vf) } else { @(Get-Content -LiteralPath (Join-Path $folder 'Diff.log') -ErrorAction SilentlyContinue) }
-                $lines = @($lines | Where-Object { "$_".Trim() })
-                $diffVerdict = if ($lines) { if (Test-Path -LiteralPath $vf) { "$($lines[0])".Trim() } else { "$($lines[-1])".Trim() } }
+                $diffVerdict = $verdictLine
             }
             $note = $notes -join '; '
             $seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
@@ -1127,6 +1182,7 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
             passed        = if ($counts) { $counts.Total - $counts.Failed - $counts.Skipped }
             failed        = if ($counts) { $counts.Failed }
             seconds       = $seconds
+            verdict       = $verdictLine
             note          = $note
             tested_at     = $testedAt
             entry_line    = $line
@@ -1143,6 +1199,7 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
             Passed       = $rec.passed
             Failed       = $rec.failed
             Seconds      = $seconds
+            Verdict      = $verdictLine
             Note         = $note
         }
     })
@@ -1155,7 +1212,7 @@ if ($r.FailedCount -or $r.Result -ne 'Passed') { exit 1 }
     })
     $failures = @(
         @($testRows | Where-Object Result -eq 'FAIL' | ForEach-Object { "test $($_.Name)" })
-        @($verifyRows | Where-Object Verify -eq 'does not' | ForEach-Object { "verify $($_.Name)" })
+        @($verifyRows | Where-Object Verify -in 'does not', 'refused' | ForEach-Object { "verify $($_.Name)" })
         @($getterRows | Where-Object Result -eq 'fail' | ForEach-Object { "getter $($_.Name)" })
     )
     $testRun = [ordered]@{ folder = $usedRun.Name; reused = [bool]$reuse; reason = $reuse }
@@ -1213,5 +1270,5 @@ function Invoke-FrameworkBootstrap {
 }
 
 Export-ModuleMember -Function Get-FrameworkManifest, Test-FrameworkRequirements, Sync-Framework, Sync-FrameworkChild,
-    Get-FrameworkStatus, Get-FrameworkTestPlan, Invoke-FrameworkTest, Invoke-ChildTask, Invoke-ChildVerify, Get-TestVerdict,
+    Get-FrameworkStatus, Get-FrameworkTestPlan, Get-FrameworkBranchCheck, Invoke-FrameworkTest, Invoke-ChildTask, Invoke-ChildVerify, Get-TestVerdict,
     New-FrameworkRunFolder, Invoke-FrameworkBootstrap, Invoke-FrameworkHeartbeat, Resolve-FrameworkEnv, Get-HeartbeatReusedRun

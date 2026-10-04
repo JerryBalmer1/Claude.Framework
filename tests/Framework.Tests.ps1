@@ -93,14 +93,16 @@ Describe 'framework.yaml' {
         $by['Claude.Ontology'].Expect.ExpectedFailures | Should -Be 16
         $by['Claude.Ontology'].Expect.Reason | Should -Not -BeNullOrEmpty
         $by['Claude.Ontology'].Verify.Script | Should -Be 'forge/tools/Invoke-PluginVerify.ps1'
-        $by['Claude.Skills'].Expect.NoTests | Should -BeTrue
+        $by['Claude.Skills'].Expect.NoTests | Should -BeFalse
+        $by['Claude.Modules'].Expect.NoTests | Should -BeFalse
         $by['Claude.Chain'].Expect.ExpectedFailures | Should -Be 0
         $by['Claude.Chain'].Verify | Should -BeNullOrEmpty
     }
 
-    It 'reads result_file: parameter for Claude.Ontology, preference for the other build-script children' {
+    It 'reads result_file: parameter for Claude.Ontology and Claude.Modules, preference for the other build-script children' {
         $by = @{}; $manifest.Children | ForEach-Object { $by[$_.Name] = $_ }
         $by['Claude.Ontology'].ResultFile | Should -Be 'parameter'
+        $by['Claude.Modules'].ResultFile | Should -Be 'parameter'
         'Claude.Chain', 'Claude.Skills', 'Claude.Portal' | ForEach-Object { $by[$_].ResultFile | Should -Be 'preference' }
         $by['Claude.Root'].ResultFile | Should -BeNullOrEmpty
     }
@@ -115,9 +117,23 @@ Describe 'framework.yaml' {
         $by['Claude.Chain'].Expect.FullTestTask | Should -BeNullOrEmpty
     }
 
-    It 'the Claude.Skills no-tests reason names no branch' {
-        $skills = $manifest.Children | Where-Object Name -eq 'Claude.Skills'
-        $skills.Expect.Reason | Should -Not -Match 'develop|main|feature/'
+    It 'every child names its expected branch: develop for Claude.Skills, main for the rest' {
+        Import-Module powershell-yaml
+        $raw = ConvertFrom-Yaml (Get-Content -LiteralPath (Join-Path $FrameworkRoot 'framework.yaml') -Raw)
+        foreach ($c in $raw.children) { $c.Keys | Should -Contain 'branch' -Because $c.name }
+        foreach ($c in $manifest.Children) {
+            $c.Branch | Should -Be $(if ($c.Name -eq 'Claude.Skills') { 'develop' } else { 'main' }) -Because $c.Name
+        }
+    }
+
+    It 'Claude.Modules and Claude.Skills are tested children with test_task Test' {
+        $by = @{}; $manifest.Children | ForEach-Object { $by[$_.Name] = $_ }
+        foreach ($n in 'Claude.Modules', 'Claude.Skills') {
+            $by[$n].BuildScript | Should -BeTrue
+            $by[$n].Expect.TestTask | Should -Be 'Test'
+            $by[$n].Expect.ExpectedFailures | Should -Be 0
+            $by[$n].Verify | Should -BeNullOrEmpty
+        }
     }
 
     It 'rejects a build-script child without result_file, and an unknown result_file' {
@@ -142,14 +158,31 @@ Describe 'framework.yaml getters' {
         $ok = "  - name: A`n    path: getters/A`n    entry:`n      script: tools/Run.ps1`n    cadence: every`n    order: 1"
     }
 
-    It 'registers the six getters as entry: none, no path, not promoted yet, Diff last' {
+    It 'registers six getters, Diff last; all but Secrets are entry: none, no path, not promoted yet' {
         $g = (Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Getters
         $g.Name | Should -Be @('Catalogue', 'Hardening', 'Incidents', 'Shape', 'Secrets', 'Diff')
-        foreach ($x in $g) {
+        foreach ($x in @($g | Where-Object Name -ne 'Secrets')) {
             $x.Entry | Should -BeNullOrEmpty
             $x.Path | Should -BeNullOrEmpty
             $x.Note | Should -Be 'not promoted to repos/ yet'
         }
+    }
+
+    It 'Secrets runs Claude.Modules tools/Find-FrameworkSecret.ps1 with -Root and -Out, order 50, every' {
+        $s = (Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Getters | Where-Object Name -eq 'Secrets'
+        $s.Path | Should -Be 'Claude.Modules'
+        $s.Entry.Script | Should -Be 'tools/Find-FrameworkSecret.ps1'
+        @($s.Entry.Parameters.Keys | Sort-Object) | Should -Be @('Out', 'Root')
+        $s.Entry.Parameters.Root | Should -Be '{framework_root}'
+        $s.Entry.Parameters.Out | Should -Be '{out}'
+        $s.Outputs | Should -Be @('findings.json', 'summary.md')
+        $s.Order | Should -Be 50
+        $s.Cadence | Should -Be 'every'
+    }
+
+    It 'an output that climbs out of {out} fails to load' {
+        $body = $ok + "`n    outputs: [../x.json]"
+        { Get-FrameworkManifest (Write-Getters 'bad-output' $body) } | Should -Throw '*relative to {out}*'
     }
 
     It 'reads a runnable getter' {
@@ -423,7 +456,7 @@ task Test {
         $forced = @{}; Get-FrameworkTestPlan -Manifest $manifest -Verify | ForEach-Object { $forced[$_.Name] = $_.Verify }
         $plain['Claude.Ontology'] | Should -Be 'heartbeat'
         $forced['Claude.Ontology'] | Should -Be 'run'
-        foreach ($n in 'Claude.Chain', 'Claude.Portal', 'Claude.Root', 'Claude.Framework') {
+        foreach ($n in 'Claude.Chain', 'Claude.Portal', 'Claude.Root', 'Claude.Modules', 'Claude.Skills', 'Claude.Framework') {
             $plain[$n] | Should -Be 'not applicable'
             $forced[$n] | Should -Be 'not applicable'
         }
@@ -822,11 +855,11 @@ Describe 'Test -Full plans full_test_task where declared' {
 
         $plain['Claude.Ontology'] | Should -Be 'Test'
         $full['Claude.Ontology'] | Should -Be 'TestFull'
-        foreach ($n in 'Claude.Chain', 'Claude.Skills', 'Claude.Portal') {
+        foreach ($n in 'Claude.Chain', 'Claude.Skills', 'Claude.Portal', 'Claude.Modules') {
             $plain[$n] | Should -Be 'Test'
             $full[$n] | Should -Be 'Test'
         }
-        foreach ($n in 'Claude.Root', 'Claude.Substrate', 'Claude.Modules') { $full[$n] | Should -BeNullOrEmpty }
+        foreach ($n in 'Claude.Root', 'Claude.Substrate') { $full[$n] | Should -BeNullOrEmpty }
         $full['Claude.Framework'] | Should -Be 'SelfTest'
     }
 
@@ -906,6 +939,239 @@ Describe 'Requirements: env entries and Invoke-Build' {
         $r.Wanted | Should -Be 'present'
         $r.Found | Should -Not -Be 'missing'
         $r.Ok | Should -BeTrue
+    }
+}
+
+Describe 'A build-script child with a Test task is in the plan' {
+    It 'a fixture child with build_script true and test_task Test is planned and selected' {
+        $yaml = Join-Path $RunRoot 'fixture-plan-tested.yaml'
+        Set-Content -LiteralPath $yaml -Value "requirements: {}`nchildren:`n  - name: Newly`n    url: u`n    default_branch: main`n    build_script: true`n    result_file: parameter`n    expect:`n      test_task: Test`n  - name: Plain`n    url: u`n    default_branch: main`n    build_script: false"
+        $plan = @{}; Get-FrameworkTestPlan -Manifest (Get-FrameworkManifest $yaml) | ForEach-Object { $plan[$_.Name] = $_ }
+        $plan['Newly'].Task | Should -Be 'Test'
+        $plan['Newly'].Selected | Should -BeTrue
+        $plan['Plain'].Task | Should -BeNullOrEmpty
+    }
+
+    It 'Claude.Modules and Claude.Skills are planned with Test, and -Only selects just them and nothing else' {
+        $manifest = Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')
+        $plan = @(Get-FrameworkTestPlan -Manifest $manifest -Only Claude.Modules, Claude.Skills)
+        ($plan | Where-Object Selected).Name | Should -Be @('Claude.Modules', 'Claude.Skills')
+        ($plan | Where-Object Selected).Task | Should -Be @('Test', 'Test')
+    }
+}
+
+Describe 'A promoted getter runs from its path under repos\' {
+    BeforeAll {
+        function New-CommittedRepo {
+            param([string]$Path, [hashtable]$Files)
+            foreach ($k in $Files.Keys) {
+                $file = Join-Path $Path $k
+                $null = New-Item -ItemType Directory -Path (Split-Path $file) -Force
+                Set-Content -LiteralPath $file -Value $Files[$k]
+            }
+            G $Path init --quiet --initial-branch=main | Out-Null
+            G $Path add -A | Out-Null
+            G $Path commit --quiet -m fixture | Out-Null
+            (& git -C $Path rev-parse HEAD)
+        }
+        $gRepos = Join-Path $RunRoot 'getter-repos'
+        # Like Claude.Modules' Find-FrameworkSecret.ps1: takes -Root and -Out, writes two files, prints the verdict last.
+        $modsHead = New-CommittedRepo (Join-Path $gRepos 'Mods') @{
+            'tools/Scan.ps1' = @'
+param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Out, [string]$Repos)
+Set-Content -LiteralPath (Join-Path $Out 'findings.json') -Value '{}'
+Set-Content -LiteralPath (Join-Path $Out 'summary.md') -Value '# summary'
+Set-Content -LiteralPath (Join-Path $Out 'proof.txt') -Value "$PID|$((Get-Location).Path)|$Root|$Repos"
+'scanning'
+'2 high, 0 medium, 0 low, 1 allowlisted'
+'@
+        }
+        $gYaml = Join-Path $RunRoot 'fixture-getter.yaml'
+        Set-Content -LiteralPath $gYaml -Value @"
+requirements:
+  pester: '$([string](Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Requirements.pester)'
+children:
+  - name: Mods
+    url: https://example.invalid/Mods.git
+    default_branch: main
+    branch: main
+    build_script: false
+getters:
+  - name: Scan
+    path: Mods
+    entry:
+      script: tools/Scan.ps1
+      parameters:
+        Root: '{framework_root}'
+        Out: '{out}'
+        Repos: '{repos_root}'
+    outputs: [findings.json, summary.md]
+    cadence: every
+    order: 1
+  - name: Short
+    path: Mods
+    entry:
+      script: tools/Scan.ps1
+      parameters:
+        Root: '{framework_root}'
+        Out: '{out}'
+    outputs: [findings.json, absent.md]
+    cadence: every
+    order: 2
+"@
+        $gManifest = Get-FrameworkManifest $gYaml
+        $gFramework = Join-Path $RunRoot 'getter-framework'
+        $gradedHead = New-CommittedRepo $gFramework @{ 'README.md' = 'fixture framework'; '.gitignore' = '.framework/' }
+        $run = Join-Path $gFramework '.framework' 'test-runs' '20260101-000000-001'
+        $null = New-Item -ItemType Directory -Path $run -Force
+        Set-Content -LiteralPath (Join-Path $run 'summary.json') -Value (@{
+                partial = $false; only = @(); env = @{}
+                rows = @(@{ Name = 'Mods'; Result = 'no build script'; Verify = 'not applicable' }, @{ Name = 'Claude.Framework'; Result = 'pass'; Verify = 'not applicable' })
+            } | ConvertTo-Json -Depth 4)
+        $hb = Invoke-FrameworkHeartbeat -Manifest $gManifest -ReposRoot $gRepos -FrameworkRoot $gFramework -SkipUp
+        $by = @{}; $hb.Getters | ForEach-Object { $by[$_.Name] = $_ }
+    }
+
+    It 'runs the entry in a fresh pwsh rooted in its path, with {framework_root}, {repos_root} and {out} substituted' {
+        $by['Scan'].Result | Should -Be 'pass'
+        $out = Join-Path $hb.Folder 'Scan'
+        $proofPid, $cwd, $root, $repos = (Get-Content -LiteralPath (Join-Path $out 'proof.txt')) -split '\|'
+        [int]$proofPid | Should -Not -Be $PID
+        $cwd | Should -Be (Join-Path $gRepos 'Mods')
+        $root | Should -Be $gFramework
+        $repos | Should -Be $gRepos
+        Join-Path $out 'findings.json' | Should -Exist
+        Join-Path $out 'summary.md' | Should -Exist
+    }
+
+    It 'reads the result: getter and graded commits, seconds and the verdict line, in result.json and heartbeat.json' {
+        $rec = Get-Content -LiteralPath (Join-Path $hb.Folder 'Scan.result.json') -Raw | ConvertFrom-Json
+        $rec.getter_commit | Should -Be $modsHead
+        $rec.graded_commit | Should -Be $gradedHead
+        $rec.seconds | Should -BeGreaterThan 0
+        $rec.verdict | Should -Be '2 high, 0 medium, 0 low, 1 allowlisted'
+        # Parameters are named, so the entry line may list them in any order.
+        $rec.entry_line | Should -BeLike '& ./tools/Scan.ps1 -*'
+        $rec.entry_line | Should -BeLike "*-Root '$gFramework'*"
+        $rec.entry_line | Should -BeLike "*-Out '$(Join-Path $hb.Folder 'Scan')'*"
+        $rec.entry_line | Should -BeLike "*-Repos '$gRepos'*"
+        $by['Scan'].Verdict | Should -Be '2 high, 0 medium, 0 low, 1 allowlisted'
+        $by['Scan'].GetterCommit | Should -Be $modsHead.Substring(0, 7)
+        $g = (Get-Content (Join-Path $hb.Folder 'heartbeat.json') -Raw | ConvertFrom-Json).getters | Where-Object name -eq 'Scan'
+        $g.getter_commit | Should -Be $modsHead
+        $g.verdict | Should -Be '2 high, 0 medium, 0 low, 1 allowlisted'
+    }
+
+    It 'a declared output the entry did not write fails the getter, naming it' {
+        $by['Short'].Result | Should -Be 'fail'
+        $by['Short'].Note | Should -Match 'missing output\(s\) under \{out\}: absent\.md'
+        $hb.Failures | Should -Be @('getter Short')
+    }
+}
+
+Describe 'Expected branch per child' {
+    BeforeAll {
+        $pester = [string](Get-FrameworkManifest (Join-Path $FrameworkRoot 'framework.yaml')).Requirements.pester
+        $bRepos = Join-Path $RunRoot 'branch-repos'
+        # Trap is checked out on a feature branch; its manifest entry expects main. Its Test task would leave ran.txt.
+        $trap = Join-Path $bRepos 'Trap'
+        $null = New-Item -ItemType Directory -Path (Join-Path $trap 'tools') -Force
+        Set-Content -LiteralPath (Join-Path $trap 'Trap.build.ps1') -Value "task Test { Set-Content -LiteralPath (Join-Path `$BuildRoot 'ran.txt') -Value ran }"
+        Set-Content -LiteralPath (Join-Path $trap 'tools' 'Run.ps1') -Value 'param($Out) Set-Content -LiteralPath (Join-Path $Out "ran.txt") -Value ran'
+        Set-Content -LiteralPath (Join-Path $trap '.gitignore') -Value 'ran.txt'
+        G $trap init --quiet --initial-branch=main | Out-Null
+        G $trap add -A | Out-Null
+        G $trap commit --quiet -m fixture | Out-Null
+        G $trap checkout --quiet -b feature/trap | Out-Null
+        $bYaml = Join-Path $RunRoot 'fixture-branch.yaml'
+        Set-Content -LiteralPath $bYaml -Value @"
+requirements:
+  powershell: '7.4'
+  pester: '$pester'
+  powershell_yaml: '0.4.12'
+children:
+  - name: Trap
+    url: https://example.invalid/Trap.git
+    default_branch: main
+    branch: main
+    build_script: true
+    result_file: none
+    verify:
+      script: tools/Run.ps1
+      plugins: [One]
+getters:
+  - name: Rooted
+    path: Trap
+    entry:
+      script: tools/Run.ps1
+      parameters:
+        Out: '{out}'
+    cadence: every
+    order: 1
+"@
+        $bManifest = Get-FrameworkManifest $bYaml
+    }
+
+    It 'a child with no branch key expects its default_branch' {
+        $yaml = Join-Path $RunRoot 'fixture-branch-default.yaml'
+        Set-Content -LiteralPath $yaml -Value "children:`n  - name: X`n    url: u`n    default_branch: develop`n    build_script: false"
+        (Get-FrameworkManifest $yaml).Children[0].Branch | Should -Be 'develop'
+    }
+
+    It 'Requirements fails the child''s row and names the branch' {
+        $row = Test-FrameworkRequirements -Manifest $bManifest -FrameworkRoot $RunRoot -ReposRoot $bRepos | Where-Object Requirement -eq 'Trap branch'
+        $row.Wanted | Should -Be 'main'
+        $row.Found | Should -Be 'feature/trap'
+        $row.Ok | Should -BeFalse
+        $row.Note | Should -Be 'on feature/trap, expected main'
+    }
+
+    It 'Requirements passes a child on its branch, and one not cloned yet' {
+        $yaml = Join-Path $RunRoot 'fixture-branch-ok.yaml'
+        Set-Content -LiteralPath $yaml -Value "requirements:`n  powershell: '7.4'`n  pester: '$pester'`n  powershell_yaml: '0.4.12'`nchildren:`n  - name: Trap`n    url: u`n    default_branch: main`n    branch: feature/trap`n    build_script: false`n  - name: Missing`n    url: u`n    default_branch: main`n    build_script: false"
+        $rows = @(Test-FrameworkRequirements -Manifest (Get-FrameworkManifest $yaml) -FrameworkRoot $RunRoot -ReposRoot $bRepos | Where-Object Requirement -like '* branch')
+        ($rows | Where-Object Requirement -eq 'Trap branch').Ok | Should -BeTrue
+        $missing = $rows | Where-Object Requirement -eq 'Missing branch'
+        $missing.Ok | Should -BeTrue
+        $missing.Note | Should -Be 'not cloned'
+    }
+
+    It 'Status shows the actual branch with the expected one appended' {
+        (Get-FrameworkStatus -Manifest $bManifest -ReposRoot $bRepos)[0].Branch | Should -Be 'feature/trap (expected main)'
+    }
+
+    It 'Test refuses the child: the row is FAIL, names the branch, and the child''s task never runs' {
+        $row = @(Invoke-FrameworkTest -Manifest $bManifest -ReposRoot $bRepos -FrameworkRoot (Join-Path $RunRoot 'branch-framework') -Only Trap)[0]
+        $row.Result | Should -Be 'FAIL'
+        $row.Note | Should -Be 'on branch feature/trap, expected main; not run'
+        Join-Path $trap 'ran.txt' | Should -Not -Exist
+    }
+
+    It 'Heartbeat refuses the verify and the getter rooted in the child, and fails' {
+        $hb = Invoke-FrameworkHeartbeat -Manifest $bManifest -ReposRoot $bRepos -FrameworkRoot (Join-Path $RunRoot 'branch-framework') -SkipUp -AllowPartial
+        $hb.VerifyRows[0].Verify | Should -Be 'refused'
+        $hb.VerifyRows[0].Note | Should -Match 'feature/trap'
+        $hb.Getters[0].Result | Should -Be 'fail'
+        $hb.Getters[0].Note | Should -Be 'Trap on branch feature/trap, expected main; not run'
+        Join-Path $hb.Folder 'Rooted' | Should -Not -Exist
+        $hb.Failures | Should -Contain 'verify Trap'
+        $hb.Failures | Should -Contain 'getter Rooted'
+    }
+
+    It 'Up refuses before Bootstrap and Sync, naming the child and its branch' {
+        # A copy of the real build in a fixture root, so Up's Requirements reads this fixture's manifest and repos\.
+        $upRoot = Join-Path $RunRoot 'branch-up'
+        $null = New-Item -ItemType Directory -Path (Join-Path $upRoot 'build'), (Join-Path $upRoot 'repos') -Force
+        Copy-Item -LiteralPath (Join-Path $FrameworkRoot 'Claude.Framework.build.ps1') -Destination $upRoot
+        Copy-Item -LiteralPath (Join-Path $FrameworkRoot 'build' 'Framework.Build.psm1'), (Join-Path $FrameworkRoot 'build' 'Bootstrap.ps1') -Destination (Join-Path $upRoot 'build')
+        Copy-Item -LiteralPath $bYaml -Destination (Join-Path $upRoot 'framework.yaml')
+        Copy-Item -LiteralPath $trap -Destination (Join-Path $upRoot 'repos' 'Trap') -Recurse
+        $build = Join-Path $upRoot 'Claude.Framework.build.ps1'
+        $out = (& pwsh -NoProfile -NonInteractive -Command "Invoke-Build Up -File '$build'" 2>&1 | Out-String) -replace '\s+', ' '
+        $LASTEXITCODE | Should -Not -Be 0
+        $out | Should -Match 'Trap branch \(on feature/trap, expected main\)'
+        Join-Path $upRoot '.framework' 'bootstrap.done' | Should -Not -Exist
+        Join-Path $upRoot 'repos' '_aside' | Should -Not -Exist
     }
 }
 

@@ -7,6 +7,8 @@
 #   expect.expected_failures  known failing tests; up to this many is pass-with-known, more is FAIL (needs reason)
 #   expect.no_tests           true when the child has no *.Tests.ps1 files; reported as no-tests (needs reason)
 #   verify                    a script under the child, run once per plugin by Heartbeat (or Test/Up -Verify)
+#   branch                    the branch the child must be on (default: default_branch). Requirements fails a row,
+#                             Test refuses the child and Up stops when the checkout is on any other branch.
 # Required when build_script is true:
 #   result_file               how Test gets a result file: parameter (the build takes -PesterConfiguration,
 #                             TestResult only), preference (the child's Invoke-Pester merges $PesterPreference),
@@ -30,36 +32,44 @@ children:
   - name: Claude.Root
     url: https://github.com/JerryBalmer1/Claude.Root.git
     default_branch: main
+    branch: main
     build_script: false
 
   - name: Claude.Chain
     url: https://github.com/JerryBalmer1/Claude.Chain.git
     default_branch: main
+    branch: main
     build_script: true
     result_file: preference
 
   - name: Claude.Substrate
     url: https://github.com/JerryBalmer1/Claude.Substrate.git
     default_branch: main
+    branch: main
     build_script: false
 
   - name: Claude.Modules
     url: https://github.com/JerryBalmer1/Claude.Modules.git
     default_branch: main
-    build_script: false
+    branch: main
+    build_script: true
+    result_file: parameter
+    expect:
+      test_task: Test
 
   - name: Claude.Skills
     url: https://github.com/JerryBalmer1/Claude.Skills.git
     default_branch: develop
+    branch: develop
     build_script: true
     result_file: preference
     expect:
-      no_tests: true
-      reason: no *.Tests.ps1 files in the checkout
+      test_task: Test
 
   - name: Claude.Ontology
     url: https://github.com/JerryBalmer1/Claude.Ontology.git
     default_branch: main
+    branch: main
     build_script: true
     result_file: parameter
     expect:
@@ -74,6 +84,7 @@ children:
   - name: Claude.Portal
     url: https://github.com/JerryBalmer1/Claude.Portal.git
     default_branch: main
+    branch: main
     build_script: true
     result_file: preference
     expect:
@@ -88,8 +99,10 @@ children:
 #               heartbeat folder), {framework_root} and {repos_root}
 #   path        relative to repos/; required unless entry is none
 # Optional: tests (true runs the getter's Pester, JUnit under its output folder), expects (expected_failures or
-# no_tests, each with reason), note.
-# None of the six is under repos/ yet, so each is entry: none with no path until it is promoted.
+# no_tests, each with reason), outputs (file names the entry must leave under {out}; a missing one fails the getter),
+# note. A getter whose path is a child's folder runs only while that child is on its expected branch.
+# The verdict line is the first line of {out}/verdict.txt, else the last line the entry printed.
+# Secrets is promoted (Claude.Modules); the other five are entry: none with no path until they are.
 
 getters:
   - name: Catalogue
@@ -121,11 +134,16 @@ getters:
     note: not promoted to repos/ yet
 
   - name: Secrets
-    entry: none
+    path: Claude.Modules
+    entry:
+      script: tools/Find-FrameworkSecret.ps1
+      parameters:
+        Root: '{framework_root}'
+        Out: '{out}'
+    outputs: [findings.json, summary.md]
     tests: false
     cadence: every
     order: 50
-    note: not promoted to repos/ yet
 
   - name: Diff
     entry: none
